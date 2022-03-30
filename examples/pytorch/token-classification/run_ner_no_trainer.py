@@ -22,12 +22,19 @@ import argparse
 import logging
 import math
 import os
+import glob
+import sys
 import random
 from pathlib import Path
+from aim import Run
+import json
+
+import numpy as np
+import pandas as pd
 
 import datasets
 import torch
-from datasets import ClassLabel, load_dataset, load_metric
+from datasets import ClassLabel, DatasetDict, load_dataset, load_metric, Dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -203,6 +210,16 @@ def parse_args():
         "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
     )
     parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
+
+    # local arguments
+    parser.add_argument("--data_dir", type=str, default='data', help='Path to your task data.')
+    parser.add_argument("--experiment_description", type=str, default='Fine tune', help="Experiment.")
+    parser.add_argument('--meta_models_split_seed', type=int, help="Meta train/dev/test fine tuned models' split seed.")
+    parser.add_argument('--warmup_proportion', type=float, default=0.4, help="Fine tune warm up.")
+    parser.add_argument('--saved_epoch', type=int, default=2, help="Which epochs of the model to save.")
+    parser.add_argument("--do_fine_tune", action="store_true", help="Fine tune")
+
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -221,9 +238,153 @@ def parse_args():
 
     return args
 
+ner_target_langs = {
+    'de': 'nl',
+    'es': 'nl', 
+    'nl': 'de',
+    'zh': 'de',
+}
+
+def get_labels(predictions, references, label_list):
+    y_pred = predictions.detach().cpu().clone().numpy()
+    y_true = references.detach().cpu().clone().numpy()
+
+    # Remove ignored index (special tokens)
+    true_predictions = [
+        [label_list[p] for (p, l) in zip(pred, gold_label) if l != -100]
+        for pred, gold_label in zip(y_pred, y_true)
+    ]
+    true_labels = [
+        [label_list[l] for (p, l) in zip(pred, gold_label) if l != -100]
+        for pred, gold_label in zip(y_pred, y_true)
+    ]
+    return true_predictions, true_labels
+
+
+def compute_metrics(metric, args):
+    results = metric.compute(zero_division=1)
+
+    if args.return_entity_level_metrics:
+        # Unpack nested dictionaries
+        final_results = {}
+        for key, value in results.items():
+            if isinstance(value, dict):
+                for n, v in value.items():
+                    final_results[f"{key}_{n}"] = v
+            else:
+                final_results[key] = value
+        return final_results
+    else:
+        return {
+            "precision": results["overall_precision"],
+            "recall": results["overall_recall"],
+            "f1": results["overall_f1"],
+            "accuracy": results["overall_accuracy"],
+        }
+
+
+def evaluate(model, dataloader, args, accelerator, label_list, return_CLS=False):
+    model.eval()
+    metric = load_metric("seqeval")
+    avg_dev_loss = 0
+    avg_cls_token = []
+
+    for step, batch in enumerate(dataloader):
+        with torch.no_grad():
+            outputs = model(**batch)
+            dev_loss = outputs.loss
+            dev_loss = dev_loss / args.gradient_accumulation_steps
+            avg_dev_loss += dev_loss.item()
+
+            if return_CLS:
+                batch_cls_tokens = outputs.hidden_states[-1][:, 0]
+                avg_cls_token.append(torch.mean(batch_cls_tokens, dim=0, keepdim=True).detach().cpu().numpy())
+
+        predictions = outputs.logits.argmax(dim=-1)
+        labels = batch["labels"]
+
+        if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
+            predictions = accelerator.pad_across_processes(predictions, dim=1, pad_index=-100)
+            labels = accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+
+        predictions_gathered = accelerator.gather(predictions)
+        labels_gathered = accelerator.gather(labels)
+        preds, refs = get_labels(predictions_gathered, labels_gathered, label_list)
+
+        metric.add_batch(
+            predictions=preds,
+            references=refs
+        )  # predictions and preferences are expected to be a nested list of labels, not label_ids
+
+    eval_metric = compute_metrics(metric, args)
+    avg_dev_loss = avg_dev_loss / len(dataloader)
+    if return_CLS:
+        avg_cls_token = np.mean(avg_cls_token, axis=0, keepdims=True)[0] 
+
+    return eval_metric, avg_dev_loss, avg_cls_token
+
+
+def read_ner_data(path: str) -> dict:
+    encoding = 'utf-8' if 'msra' in path else 'latin-1'
+
+    with open(path, 'r', encoding=encoding) as f:
+        data_dict = {'tokens': [], 'ner_tags': []}
+        new_senetence_tokens = []
+        new_senetence_ner_tags = []
+
+        for line in f:
+            if line.startswith('-DOCSTART') or line == '' or line == '\n':
+                if new_senetence_tokens:
+                    data_dict['tokens'].append(new_senetence_tokens)
+                    data_dict['ner_tags'].append(new_senetence_ner_tags)
+                    new_senetence_tokens = []
+                    new_senetence_ner_tags = []
+            else:
+                token = line.split()[0]
+                label = line.split()[-1]
+                new_senetence_tokens.append(token)
+                new_senetence_ner_tags.append(label)
+
+        assert len(data_dict['tokens']) == len(data_dict['ner_tags'])   
+
+    return data_dict
+
+
+def seed_everything(seed=42):
+    # system
+    random.seed(seed)
+    np.random.seed(seed)
+    # torch
+    torch.manual_seed(seed)
+    set_seed(seed)
+    # cudnn backend
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False 
+
 
 def main():
     args = parse_args()
+    seed_everything(0 if args.seed is None else args.seed)
+
+    DATA_DIR = args.data_dir
+    OUTPUT_DIR = args.output_dir
+    METRIC = 'f1' if args.task_name == 'ner' else 'accuracy'
+    TARGET_LANGS = ner_target_langs.keys() if args.task_name == 'ner' else None
+
+    # Initialize a new run
+    run = Run(experiment=f'{args.experiment_description} for {args.task_name}.')
+
+    # Log run parameters
+    run["hparams"] = {
+        "cli": sys.argv
+    }
+
+    for arg in vars(args):
+        try:
+            run["hparams", arg] = getattr(args, arg)
+        except   TypeError:
+            run["hparams", arg] = str(getattr(args, arg))
+
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     accelerator = Accelerator()
@@ -245,9 +406,6 @@ def main():
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
 
-    # If passed along, set the training seed now.
-    if args.seed is not None:
-        set_seed(args.seed)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -261,6 +419,10 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
+
+    # Use the device given by the `accelerator` object.
+    device = accelerator.device
+
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
     # or just provide the name of one of the public datasets for token classification task available on the hub at https://huggingface.co/datasets/
     # (the dataset will be downloaded automatically from the datasets Hub).
@@ -270,339 +432,386 @@ def main():
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
-    else:
-        data_files = {}
-        if args.train_file is not None:
-            data_files["train"] = args.train_file
-        if args.validation_file is not None:
-            data_files["validation"] = args.validation_file
-        extension = args.train_file.split(".")[-1]
-        raw_datasets = load_dataset(extension, data_files=data_files)
-    # Trim a number of training examples
-    if args.debug:
-        for split in raw_datasets.keys():
-            raw_datasets[split] = raw_datasets[split].select(range(100))
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
 
-    if raw_datasets["train"] is not None:
-        column_names = raw_datasets["train"].column_names
-        features = raw_datasets["train"].features
-    else:
-        column_names = raw_datasets["validation"].column_names
-        features = raw_datasets["validation"].features
+    if args.do_fine_tune:
+        logger.info("======================================= Fine Tuning =======================================")
+        # Output folder for fine-tuned models on En train data
+        models_dir = os.path.join(OUTPUT_DIR, 'FineTuned_models')
+        os.makedirs(models_dir, exist_ok=True)
 
-    if args.text_column_name is not None:
-        text_column_name = args.text_column_name
-    elif "tokens" in column_names:
-        text_column_name = "tokens"
-    else:
-        text_column_name = column_names[0]
+        # a little trick to seed all 240 models
+        seed = 1000000 + len(glob.glob(os.path.join(models_dir, f'model-*' )))
+        run["hparams", 'seed'] = seed
+        seed_everything(seed)
 
-    if args.label_column_name is not None:
-        label_column_name = args.label_column_name
-    elif f"{args.task_name}_tags" in column_names:
-        label_column_name = f"{args.task_name}_tags"
-    else:
-        label_column_name = column_names[1]
+        raw_datasets = DatasetDict()
+            
+        if args.task_name == 'ner':
+            # en
+            raw_datasets['train'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'train.txt')))
+            raw_datasets['en_dev'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'valid.txt')))
+            raw_datasets['en_test'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'test.txt')))
 
-    # In the event the labels are not a `Sequence[ClassLabel]`, we will need to go through the dataset to get the
-    # unique labels.
-    def get_label_list(labels):
-        unique_labels = set()
-        for label in labels:
-            unique_labels = unique_labels | set(label)
-        label_list = list(unique_labels)
-        label_list.sort()
-        return label_list
+            # de
+            raw_datasets['de_dev'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'deu.testa.txt')))
+            raw_datasets['de_test'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'deu.testb.txt')))
 
-    if isinstance(features[label_column_name].feature, ClassLabel):
-        label_list = features[label_column_name].feature.names
-        # No need to convert the labels since they are already ints.
-        label_to_id = {i: i for i in range(len(label_list))}
-    else:
-        label_list = get_label_list(raw_datasets["train"][label_column_name])
-        label_to_id = {l: i for i, l in enumerate(label_list)}
-    num_labels = len(label_list)
+            rand_100_idxs = np.random.randint(len(raw_datasets['de_dev']), size=100)
+            raw_datasets['de_100_dev'] = raw_datasets['de_dev'].select(rand_100_idxs)
 
-    # Map that sends B-Xxx label to its I-Xxx counterpart
-    b_to_i_label = []
-    for idx, label in enumerate(label_list):
-        if label.startswith("B-") and label.replace("B-", "I-") in label_list:
-            b_to_i_label.append(label_list.index(label.replace("B-", "I-")))
+            # es
+            raw_datasets['es_dev'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'esp.testa.txt')))
+            raw_datasets['es_test'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'esp.testb.txt')))
+
+            rand_100_idxs = np.random.randint(len(raw_datasets['es_dev']), size=100)
+            raw_datasets['es_100_dev'] = raw_datasets['es_dev'].select(rand_100_idxs)
+
+            # nl
+            raw_datasets['nl_dev'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'ned.testa.txt')))
+            raw_datasets['nl_test'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'ned.testb.txt')))
+
+            rand_100_idxs = np.random.randint(len(raw_datasets['nl_dev']), size=100)
+            raw_datasets['nl_100_dev'] = raw_datasets['nl_dev'].select(rand_100_idxs)
+
+            # zh
+            raw_datasets['zh_dev'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'msra_train_bio.txt')))
+            # for zh lang there is no seperate dev data, so we sample it from the train, and according to the paper zh ALL-Target data is 4499
+            rand_4499_idxs = np.random.randint(len(raw_datasets['zh_dev']), size=4499)
+            raw_datasets['zh_dev'] = raw_datasets['zh_dev'].select(rand_4499_idxs)
+            raw_datasets['zh_test'] = Dataset.from_dict(read_ner_data(os.path.join(DATA_DIR, 'msra_test_bio.txt')))
+
+            rand_100_idxs = np.random.randint(len(raw_datasets['zh_dev']), size=100)
+            raw_datasets['zh_100_dev'] = raw_datasets['zh_dev'].select(rand_100_idxs)
+            
+        print(raw_datasets)
+
+        # Trim a number of training examples
+        if args.debug:
+            for split in raw_datasets.keys():
+                raw_datasets[split] = raw_datasets[split].select(range(100))
+        # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
+        # https://huggingface.co/docs/datasets/loading_datasets.html.
+
+        if raw_datasets["train"] is not None:
+            column_names = raw_datasets["train"].column_names
+            features = raw_datasets["train"].features
         else:
-            b_to_i_label.append(idx)
+            column_names = raw_datasets["en_dev"].column_names
+            features = raw_datasets["en_dev"].features
+
+        if args.text_column_name is not None:
+            text_column_name = args.text_column_name
+        elif "tokens" in column_names:
+            text_column_name = "tokens"
+        else:
+            text_column_name = column_names[0]
+
+        if args.label_column_name is not None:
+            label_column_name = args.label_column_name
+        elif f"{args.task_name}_tags" in column_names:
+            label_column_name = f"{args.task_name}_tags"
+        else:
+            label_column_name = column_names[1]
+
+        # In the event the labels are not a `Sequence[ClassLabel]`, we will need to go through the dataset to get the
+        # unique labels.
+        def get_label_list(labels):
+            unique_labels = set()
+            for label in labels:
+                unique_labels = unique_labels | set(label)
+            label_list = list(unique_labels)
+            label_list.sort()
+            return label_list
+
+        if isinstance(features[label_column_name].feature, ClassLabel):
+            label_list = features[label_column_name].feature.names
+            # No need to convert the labels since they are already ints.
+            label_to_id = {i: i for i in range(len(label_list))}
+        else:
+            label_list = get_label_list(raw_datasets["train"][label_column_name])
+            label_to_id = {l: i for i, l in enumerate(label_list)}
+        num_labels = len(label_list)
+
+        # Map that sends B-Xxx label to its I-Xxx counterpart
+        b_to_i_label = []
+        for idx, label in enumerate(label_list):
+            if label.startswith("B-") and label.replace("B-", "I-") in label_list:
+                b_to_i_label.append(label_list.index(label.replace("B-", "I-")))
+            else:
+                b_to_i_label.append(idx)
 
     # Load pretrained model and tokenizer
-    #
-    # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
-    if args.config_name:
-        config = AutoConfig.from_pretrained(args.config_name, num_labels=num_labels)
-    elif args.model_name_or_path:
-        config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels)
-    else:
-        config = CONFIG_MAPPING[args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
+        #
+        # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
+        # download model & vocab.
+        if args.config_name:
+            config = AutoConfig.from_pretrained(args.config_name, num_labels=num_labels)
+        elif args.model_name_or_path:
+            config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels)
+        else:
+            config = CONFIG_MAPPING[args.model_type]()
+            logger.warning("You are instantiating a new config instance from scratch.")
 
-    tokenizer_name_or_path = args.tokenizer_name if args.tokenizer_name else args.model_name_or_path
-    if not tokenizer_name_or_path:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-        )
+        tokenizer_name_or_path = args.tokenizer_name if args.tokenizer_name else args.model_name_or_path
+        if not tokenizer_name_or_path:
+            raise ValueError(
+                "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+                "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+            )
 
-    if config.model_type in {"gpt2", "roberta"}:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=True, add_prefix_space=True)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+        model = AutoModelForTokenClassification.from_pretrained(args.model_name_or_path, num_labels=len(label_list),
+                                                                output_hidden_states=True)  
 
-    if args.model_name_or_path:
-        model = AutoModelForTokenClassification.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-        )
-    else:
-        logger.info("Training new model from scratch")
-        model = AutoModelForTokenClassification.from_config(config)
+        model.resize_token_embeddings(len(tokenizer))
 
-    model.resize_token_embeddings(len(tokenizer))
+        # Preprocessing the datasets.
+        # First we tokenize all the texts.
+        padding = "max_length" if args.pad_to_max_length else False
 
-    # Preprocessing the datasets.
-    # First we tokenize all the texts.
-    padding = "max_length" if args.pad_to_max_length else False
+        # Tokenize all texts and align the labels with them.
 
-    # Tokenize all texts and align the labels with them.
+        def tokenize_and_align_labels(examples):
+            tokenized_inputs = tokenizer(
+                examples[text_column_name],
+                max_length=args.max_length,
+                padding=padding,
+                truncation=True,
+                # We use this argument because the texts in our dataset are lists of words (with a label for each word).
+                is_split_into_words=True,
+            )
 
-    def tokenize_and_align_labels(examples):
-        tokenized_inputs = tokenizer(
-            examples[text_column_name],
-            max_length=args.max_length,
-            padding=padding,
-            truncation=True,
-            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
-            is_split_into_words=True,
-        )
-
-        labels = []
-        for i, label in enumerate(examples[label_column_name]):
-            word_ids = tokenized_inputs.word_ids(batch_index=i)
-            previous_word_idx = None
-            label_ids = []
-            for word_idx in word_ids:
-                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
-                # ignored in the loss function.
-                if word_idx is None:
-                    label_ids.append(-100)
-                # We set the label for the first token of each word.
-                elif word_idx != previous_word_idx:
-                    label_ids.append(label_to_id[label[word_idx]])
-                # For the other tokens in a word, we set the label to either the current label or -100, depending on
-                # the label_all_tokens flag.
-                else:
-                    if args.label_all_tokens:
-                        label_ids.append(b_to_i_label[label_to_id[label[word_idx]]])
-                    else:
+            labels = []
+            for i, label in enumerate(examples[label_column_name]):
+                word_ids = tokenized_inputs.word_ids(batch_index=i)
+                previous_word_idx = None
+                label_ids = []
+                for word_idx in word_ids:
+                    # Special tokens have a word id that is None. We set the label to -100 so they are automatically
+                    # ignored in the loss function.
+                    if word_idx is None:
                         label_ids.append(-100)
-                previous_word_idx = word_idx
+                    # We set the label for the first token of each word.
+                    elif word_idx != previous_word_idx:
+                        try:
+                            label_ids.append(label_to_id[label[word_idx]])
+                        except KeyError:
+                            print('Key Error', label[word_idx])
+                    # For the other tokens in a word, we set the label to either the current label or -100, depending on
+                    # the label_all_tokens flag.
+                    else:
+                        if args.label_all_tokens:
+                            label_ids.append(b_to_i_label[label_to_id[label[word_idx]]])
+                        else:
+                            label_ids.append(-100)
+                    previous_word_idx = word_idx
 
-            labels.append(label_ids)
-        tokenized_inputs["labels"] = labels
-        return tokenized_inputs
+                labels.append(label_ids)
+            tokenized_inputs["labels"] = labels
+            return tokenized_inputs
 
-    with accelerator.main_process_first():
-        processed_raw_datasets = raw_datasets.map(
-            tokenize_and_align_labels,
-            batched=True,
-            remove_columns=raw_datasets["train"].column_names,
-            desc="Running tokenizer on dataset",
+        with accelerator.main_process_first():
+            processed_raw_datasets = raw_datasets.map(
+                tokenize_and_align_labels,
+                batched=True,
+                remove_columns=raw_datasets["train"].column_names,
+                desc="Running tokenizer on dataset",
+            )  
+
+        # Log a few random samples from the training set:
+        for index in random.sample(range(len(processed_raw_datasets['train'])), 3):
+            logger.info(f"Sample {index} of the training set: {processed_raw_datasets['train'][index]}.")
+
+        # DataLoaders creation:
+        if args.pad_to_max_length:
+            # If padding was already done ot max length, we use the default data collator that will just convert everything
+            # to tensors.
+            data_collator = default_data_collator
+        else:
+            # Otherwise, `DataCollatorForTokenClassification` will apply dynamic padding for us (by padding to the maximum length of
+            # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
+            # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
+            data_collator = DataCollatorForTokenClassification(
+                tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None)
+            )
+
+        dataloaders = {}    
+        dataloaders['train'] = DataLoader(processed_raw_datasets['train'], shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size)
+        dataloaders['en_dev'] = DataLoader(processed_raw_datasets['en_dev'], shuffle=False, collate_fn=data_collator, batch_size=args.per_device_train_batch_size)
+        dataloaders['en_test'] = DataLoader(processed_raw_datasets['en_test'], shuffle=False, collate_fn=data_collator, batch_size=args.per_device_train_batch_size)
+
+        for lang in TARGET_LANGS:
+            dataloaders[f'{lang}_dev'] = DataLoader(processed_raw_datasets[f'{lang}_dev'], shuffle=False, collate_fn=data_collator, batch_size=args.per_device_train_batch_size)
+            dataloaders[f'{lang}_100_dev'] = DataLoader(processed_raw_datasets[f'{lang}_100_dev'], shuffle=False, collate_fn=data_collator, batch_size=args.per_device_train_batch_size)
+            dataloaders[f'{lang}_test'] = DataLoader(processed_raw_datasets[f'{lang}_test'], shuffle=False, collate_fn=data_collator, batch_size=args.per_device_train_batch_size)
+            
+        # Optimizer
+        # Split weights in two groups, one with weight decay and the other not.
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": args.weight_decay,
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+
+        model.to(device)
+
+        # Prepare everything with our `accelerator`.
+        model, optimizer = accelerator.prepare(model, optimizer)
+
+        for i_dataloader in dataloaders.keys():
+            dataloaders[i_dataloader] = accelerator.prepare(dataloaders[i_dataloader])  
+
+        # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
+        # shorter in multiprocess)
+
+        # Scheduler and math around the number of training steps.
+        num_update_steps_per_epoch = math.ceil(len(dataloaders['train']) / args.gradient_accumulation_steps)
+        if args.max_train_steps is None:
+            args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        else:
+            args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+        num_train_optimization_steps = int(len(raw_datasets['train']) / args.per_device_train_batch_size / args.gradient_accumulation_steps) * args.num_train_epochs    
+        warm_up_steps = int(args.warmup_proportion * num_train_optimization_steps)
+        
+        lr_scheduler = get_scheduler(
+            name=args.lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=warm_up_steps,
+            num_training_steps=args.max_train_steps,
         )
 
-    train_dataset = processed_raw_datasets["train"]
-    eval_dataset = processed_raw_datasets["validation"]
+        # Train!
+        total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+        logger.info("============= Running training =============")
+        logger.info(f"  Num train examples = {len(raw_datasets['train'])}")
+        logger.info(f"  Num epochs = {args.num_train_epochs}")
+        logger.info(f"  Seed = {seed}")
+        logger.info(f"  Learning rate = {args.learning_rate}")
+        logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+        logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+        logger.info(f"  Total optimization steps = {args.max_train_steps}")
+        logger.info(f"  Warm up steps = {warm_up_steps}")
 
-    # DataLoaders creation:
-    if args.pad_to_max_length:
-        # If padding was already done ot max length, we use the default data collator that will just convert everything
-        # to tensors.
-        data_collator = default_data_collator
-    else:
-        # Otherwise, `DataCollatorForTokenClassification` will apply dynamic padding for us (by padding to the maximum length of
-        # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
-        # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
-        data_collator = DataCollatorForTokenClassification(
-            tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None)
-        )
+        # Only show the progress bar once on each machine.
+        progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+        completed_steps = 0
+        iter_num = len(dataloaders['train'])
+        model_evals_table = {}
 
-    train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
-    )
-    eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
-
-    # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-
-    # Use the device given by the `accelerator` object.
-    device = accelerator.device
-    model.to(device)
-
-    # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader
-    )
-
-    # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
-    # shorter in multiprocess)
-
-    # Scheduler and math around the number of training steps.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    else:
-        args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=args.max_train_steps,
-    )
-
-    # Metrics
-    metric = load_metric("seqeval")
-
-    def get_labels(predictions, references):
-        # Transform predictions and references tensos to numpy arrays
-        if device.type == "cpu":
-            y_pred = predictions.detach().clone().numpy()
-            y_true = references.detach().clone().numpy()
-        else:
-            y_pred = predictions.detach().cpu().clone().numpy()
-            y_true = references.detach().cpu().clone().numpy()
-
-        # Remove ignored index (special tokens)
-        true_predictions = [
-            [label_list[p] for (p, l) in zip(pred, gold_label) if l != -100]
-            for pred, gold_label in zip(y_pred, y_true)
-        ]
-        true_labels = [
-            [label_list[l] for (p, l) in zip(pred, gold_label) if l != -100]
-            for pred, gold_label in zip(y_pred, y_true)
-        ]
-        return true_predictions, true_labels
-
-    def compute_metrics():
-        results = metric.compute()
-        if args.return_entity_level_metrics:
-            # Unpack nested dictionaries
-            final_results = {}
-            for key, value in results.items():
-                if isinstance(value, dict):
-                    for n, v in value.items():
-                        final_results[f"{key}_{n}"] = v
-                else:
-                    final_results[key] = value
-            return final_results
-        else:
-            return {
-                "precision": results["overall_precision"],
-                "recall": results["overall_recall"],
-                "f1": results["overall_f1"],
-                "accuracy": results["overall_accuracy"],
-            }
-
-    # Train!
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    completed_steps = 0
-
-    for epoch in range(args.num_train_epochs):
-        model.train()
-        for step, batch in enumerate(train_dataloader):
-            outputs = model(**batch)
-            loss = outputs.loss
-            loss = loss / args.gradient_accumulation_steps
-            accelerator.backward(loss)
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                progress_bar.update(1)
-                completed_steps += 1
-
-            if completed_steps >= args.max_train_steps:
-                break
-
-        model.eval()
-        for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
+        for epoch in range(args.num_train_epochs + 1):
+            model.train()
+            avg_train_loss = 0
+            
+            for step, batch in enumerate(dataloaders['train']):
                 outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1)
-            labels = batch["labels"]
-            if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
-                predictions = accelerator.pad_across_processes(predictions, dim=1, pad_index=-100)
-                labels = accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+                loss = outputs.loss
+                loss = loss / args.gradient_accumulation_steps
+                
+                if epoch != 0:
+                    accelerator.backward(loss)
 
-            predictions_gathered = accelerator.gather(predictions)
-            labels_gathered = accelerator.gather(labels)
-            preds, refs = get_labels(predictions_gathered, labels_gathered)
-            metric.add_batch(
-                predictions=preds,
-                references=refs,
-            )  # predictions and preferences are expected to be a nested list of labels, not label_ids
+                    if step % args.gradient_accumulation_steps == 0 or step == iter_num - 1:
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
+                        progress_bar.update(1)
+                        completed_steps += 1
 
-        # eval_metric = metric.compute()
-        eval_metric = compute_metrics()
-        accelerator.print(f"epoch {epoch}:", eval_metric)
+                avg_train_loss += loss.item()
 
-        if args.push_to_hub and epoch < args.num_train_epochs - 1:
+                track_step = epoch * iter_num + step
+                run.track(loss.item(), name="Loss", step=track_step, context={"subset": "train", "lang": "en"})
+            
+            # Track En-dev
+            eval_metric_en_dev, loss_dev, _ = evaluate(model, dataloaders['en_dev'], args, accelerator, label_list)
+            run.track(eval_metric_en_dev[METRIC], name='F1', step=epoch, context={"lang": "en"})
+            run.track(loss_dev / len(dataloaders[f'en_dev']), name='Loss', step=epoch, context={"subset": "dev", "lang": "en"})  
+            accelerator.print(f"epoch {epoch}: Train loss {avg_train_loss / iter_num} Dev loss {loss_dev}")
+
+            logger.info(f"======================================= Dev Evaluations =======================================")
+            logger.info(f"======================================= Lang en {eval_metric_en_dev[METRIC]} =======================================")
+
+            # Track pivot-dev
+            for lang in TARGET_LANGS:
+                # ALL-Target evals
+                eval_metric, loss_dev, cls_dev_token = evaluate(model, dataloaders[f'{lang}_dev'], args, accelerator, label_list, return_CLS=True)  
+                run.track(eval_metric[METRIC], name='F1', step=epoch, context={"lang": lang})
+                run.track(loss_dev / len(dataloaders[f'{lang}_dev']), name='Loss', step=epoch, context={"subset": "dev", "lang": lang}) 
+            
+                logger.info(f"======================================= Lang {lang} {eval_metric[METRIC]} =======================================")
+
+        if eval_metric_en_dev[METRIC] > 0.5:
+            # Track model name    
+            model_name = f'model-seed_{seed}-lr_{args.learning_rate}-ep_{epoch}'
+            run["hparams", 'model_name'] = model_name
+
+            logger.info(f"======================================= Save model =======================================")
             accelerator.wait_for_everyone()
+            checkpoint_path = os.path.join(models_dir, model_name)
             unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
+            unwrapped_model.save_pretrained(checkpoint_path, save_function=accelerator.save)               
+
+
+            logger.info(f"======================================= Save tokenizer =======================================")
+            accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-                )
-
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
+                if args.push_to_hub:
+                    repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
 
 
+            logger.info(f"======================================= Prepare all_models_evals.json file =======================================")           
+            model_evals_table[model_name] = {
+                'En_Dev': eval_metric_en_dev[METRIC]
+            }
+
+            for lang in TARGET_LANGS:
+                # save eval metric
+                model_evals_table[model_name][f'All-Target_{lang}'] = eval_metric[METRIC]
+                # save cls
+                np.save(checkpoint_path + '/cls_' + lang + '_dev', cls_dev_token)
+
+                # 100-Target evals
+                eval_metric, loss_dev, _ = evaluate(model, dataloaders[f'{lang}_100_dev'], args, accelerator, label_list)
+                model_evals_table[model_name][f'100-Target_{lang}'] = eval_metric[METRIC]
+
+                # Pivot-Dev evals
+                pivot_lang = eval(args.task_name + '_target_langs')[lang]
+                eval_metric, loss_dev, _ = evaluate(model, dataloaders[f'{pivot_lang}_dev'], args, accelerator, label_list)
+                model_evals_table[model_name][f'Pivot_{lang}'] = eval_metric[METRIC]
+
+                # Test evals
+                eval_metric, loss_test, cls_test_token = evaluate(model, dataloaders[f'{lang}_test'], args, accelerator, label_list, return_CLS=True)  
+                model_evals_table[model_name][f'Test_{lang}'] = eval_metric[METRIC]
+                # save cls
+                np.save(checkpoint_path + '/cls_' + lang + '_test', cls_test_token)
+            
+        saved_path = os.path.join(OUTPUT_DIR, 'all_models_evals.json')
+        isExists = os.path.exists(saved_path)
+
+        if not isExists:
+            with open(saved_path, "w") as f:
+                json.dump(model_evals_table, f)
+        else:    
+            with open(saved_path, 'r+') as f:
+                all_models_evals_dict = json.load(f)
+                all_models_evals_dict.update(model_evals_table)
+                f.seek(0)
+                json.dump(all_models_evals_dict, f)
+
+        logger.info(f"Json file is saved at {saved_path}")          
+
+        logger.info("======================================= Fine Tuning Done! =======================================") 
+        
 if __name__ == "__main__":
     main()
