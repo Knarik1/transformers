@@ -233,7 +233,7 @@ def parse_args():
     parser.add_argument("--do_lms_train", action="store_true", help="LMS train")
     parser.add_argument("--do_lms_predict", action="store_true", help="Predict")
     parser.add_argument("--do_en_cls", action="store_true", help="En feature extraction")
-    parser.add_argument('--warmup_proportion', type=float, default=0.4, help="Fine tune warm up.")
+    parser.add_argument('--warmup_proportion', type=float, help="Fine tune warm up.")
     parser.add_argument("--lms_num_train_epochs", type=int, default=3, help="Total number of training epochs to perform in LMS.")
     parser.add_argument("--lms_learning_rate", type=float, help="Learning rate in LMS.")
     parser.add_argument('--lms_learning_rates', nargs='+', help="Learning rates in LMS.")
@@ -754,7 +754,10 @@ def main():
             args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
         num_train_optimization_steps = int(len(raw_datasets['train']) / args.per_device_train_batch_size / args.gradient_accumulation_steps) * args.num_train_epochs    
-        warm_up_steps = int(args.warmup_proportion * num_train_optimization_steps)
+        if args.warmup_proportion:
+            warm_up_steps = int(args.warmup_proportion * num_train_optimization_steps)
+        else:
+            warm_up_steps = args.num_warmup_steps    
         
         lr_scheduler = get_scheduler(
             name=args.lr_scheduler_type,
