@@ -22,18 +22,22 @@ import argparse
 import logging
 import math
 import os
-import glob
 import sys
+import glob
 import random
-from pathlib import Path
-from aim import Run
+import csv
 import json
-
+from pathlib import Path
 import numpy as np
 import pandas as pd
+from aim import Run
+from functools import cache
+import lang2vec.lang2vec as l2v
 
 import datasets
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from datasets import ClassLabel, DatasetDict, load_dataset, load_metric, Dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -64,6 +68,13 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/toke
 # You should update this to your particular problem to have better documentation of `model_type`
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+ner_target_langs = {
+    'de': 'nl',
+    'es': 'nl', 
+    'nl': 'de',
+    'zh': 'de'
+}
 
 
 def parse_args():
@@ -211,13 +222,27 @@ def parse_args():
     )
     parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
 
+
     # local arguments
     parser.add_argument("--data_dir", type=str, default='data', help='Path to your task data.')
     parser.add_argument("--experiment_description", type=str, default='Fine tune', help="Experiment.")
     parser.add_argument('--meta_models_split_seed', type=int, help="Meta train/dev/test fine tuned models' split seed.")
-    parser.add_argument('--warmup_proportion', type=float, default=0.4, help="Fine tune warm up.")
     parser.add_argument('--saved_epoch', type=int, default=2, help="Which epochs of the model to save.")
     parser.add_argument("--do_fine_tune", action="store_true", help="Fine tune")
+    parser.add_argument("--do_lms_hyperparam_search", action="store_true", help="LMS hyperparameter ")
+    parser.add_argument("--do_lms_train", action="store_true", help="LMS train")
+    parser.add_argument("--do_lms_predict", action="store_true", help="Predict")
+    parser.add_argument("--do_en_cls", action="store_true", help="En feature extraction")
+    parser.add_argument('--warmup_proportion', type=float, default=0.4, help="Fine tune warm up.")
+    parser.add_argument("--lms_num_train_epochs", type=int, default=3, help="Total number of training epochs to perform in LMS.")
+    parser.add_argument("--lms_learning_rate", type=float, help="Learning rate in LMS.")
+    parser.add_argument('--lms_learning_rates', nargs='+', help="Learning rates in LMS.")
+    parser.add_argument("--lms_hidden_size", type=int, help="Hidden size in LMS.")
+    parser.add_argument("--lms_batch_size", type=int, help="Batch size in LMS.")
+    parser.add_argument("--lms_batch_sizes", nargs='+', help="Batch sizes in LMS.")
+    parser.add_argument("--lms_target_lang", type=str, default='es', help="Target language in LMS.")
+    parser.add_argument("--lms_model_seed", type=int, help="Model seed in LMS.")
+    parser.add_argument("--lms_validate_on_meta_train_60", type=str, default='no', help="Weather to validate on meta train[:60] or dev split in LMS.")
 
 
     args = parser.parse_args()
@@ -238,12 +263,80 @@ def parse_args():
 
     return args
 
-ner_target_langs = {
-    'de': 'nl',
-    'es': 'nl', 
-    'nl': 'de',
-    'zh': 'de',
-}
+
+def kendall_rank_correlation(y_true, y_score):
+    '''
+    Kendall Rank Correlation Coefficient
+    r = [(number of concordant pairs) - (number of discordant pairs)] / [n(n-1)/2]
+    :param y_true:
+    :param y_score:
+    :return:
+    '''
+
+    # create labels
+    golden_label = []
+    for i in range(len(y_true) - 1):
+        for j in range(i + 1, len(y_true)):
+            if y_true[i] > y_true[j]:
+                tmp_label = 1
+            elif y_true[i] < y_true[j]:
+                tmp_label = -1
+            else:
+                tmp_label = 0
+            golden_label.append(tmp_label)
+
+    # evaluate
+    pred_label = []
+    for i in range(len(y_score) - 1):
+        for j in range(i + 1, len(y_score)):
+            if y_score[i] > y_score[j]:
+                tmp_label = 1
+            elif y_score[i] < y_score[j]:
+                tmp_label = -1
+            else:
+                tmp_label = 0
+            pred_label.append(tmp_label)
+
+    # res
+    n_concordant_pairs = sum([1 if i == j else 0 for i, j in zip(golden_label, pred_label)])
+    n_discordant_pairs = sum(
+        [1 if ((i == 1 and j == -1) or (i == -1 and j == 1)) else 0 for i, j in zip(golden_label, pred_label)])
+
+    N = len(y_score)
+    res = (n_concordant_pairs - n_discordant_pairs) / (N * (N - 1) / 2)
+    return res
+
+
+def read_ner_data(path: str) -> dict:
+    encoding = 'latin-1' if 'deu' in path else 'utf-8'
+
+    with open(path, 'r', encoding=encoding) as f:
+        data_dict = {'tokens': [], 'ner_tags': []}
+        new_senetence_tokens = []
+        new_senetence_ner_tags = []
+
+        for line in f:
+            if line.startswith('-DOCSTART') or line == '' or line == '\n':
+                if new_senetence_tokens:
+                    data_dict['tokens'].append(new_senetence_tokens)
+                    data_dict['ner_tags'].append(new_senetence_ner_tags)
+                    new_senetence_tokens = []
+                    new_senetence_ner_tags = []
+            else:
+                token = line.split()[0]
+                label = line.split()[-1]
+                new_senetence_tokens.append(token)
+                new_senetence_ner_tags.append(label)
+
+        assert len(data_dict['tokens']) == len(data_dict['ner_tags'])   
+
+    return data_dict
+
+
+@cache
+def load_vector(path):
+    return torch.from_numpy(np.load(path)).view(-1)        
+
 
 def get_labels(predictions, references, label_list):
     y_pred = predictions.detach().cpu().clone().numpy()
@@ -263,7 +356,6 @@ def get_labels(predictions, references, label_list):
 
 def compute_metrics(metric, args):
     results = metric.compute(zero_division=1)
-
     if args.return_entity_level_metrics:
         # Unpack nested dictionaries
         final_results = {}
@@ -287,7 +379,7 @@ def evaluate(model, dataloader, args, accelerator, label_list, return_CLS=False)
     model.eval()
     metric = load_metric("seqeval")
     avg_dev_loss = 0
-    avg_cls_token = []
+    avg_cls_tokens = []
 
     for step, batch in enumerate(dataloader):
         with torch.no_grad():
@@ -298,11 +390,10 @@ def evaluate(model, dataloader, args, accelerator, label_list, return_CLS=False)
 
             if return_CLS:
                 batch_cls_tokens = outputs.hidden_states[-1][:, 0]
-                avg_cls_token.append(torch.mean(batch_cls_tokens, dim=0, keepdim=True).detach().cpu().numpy())
+                avg_cls_tokens.append(torch.mean(batch_cls_tokens, dim=0, keepdim=True).detach().cpu().numpy())
 
         predictions = outputs.logits.argmax(dim=-1)
         labels = batch["labels"]
-
         if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
             predictions = accelerator.pad_across_processes(predictions, dim=1, pad_index=-100)
             labels = accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
@@ -310,44 +401,27 @@ def evaluate(model, dataloader, args, accelerator, label_list, return_CLS=False)
         predictions_gathered = accelerator.gather(predictions)
         labels_gathered = accelerator.gather(labels)
         preds, refs = get_labels(predictions_gathered, labels_gathered, label_list)
-
         metric.add_batch(
             predictions=preds,
-            references=refs
+            references=refs,
         )  # predictions and preferences are expected to be a nested list of labels, not label_ids
 
+    
     eval_metric = compute_metrics(metric, args)
-    avg_dev_loss = avg_dev_loss / len(dataloader)
-    if return_CLS:
-        avg_cls_token = np.mean(avg_cls_token, axis=0, keepdims=True)[0] 
+    avg_cls_token = np.mean(avg_cls_tokens, axis=0, keepdims=True)[0] 
 
-    return eval_metric, avg_dev_loss, avg_cls_token
+    return eval_metric, avg_dev_loss / len(dataloader), avg_cls_token
 
 
-def read_ner_data(path: str) -> dict:
-    encoding = 'utf-8' if 'msra' in path else 'latin-1'
+def get_meta_splits(output_dir, seed):
+    model_folder_paths = np.array(glob.glob(os.path.join(output_dir, f'FineTuned_models/model-seed_*')))
+    model_folder_paths_idx = np.random.RandomState(seed=seed).permutation(len(model_folder_paths))
 
-    with open(path, 'r', encoding=encoding) as f:
-        data_dict = {'tokens': [], 'ner_tags': []}
-        new_senetence_tokens = []
-        new_senetence_ner_tags = []
+    meta_train_folder_paths = model_folder_paths[model_folder_paths_idx[:120]]
+    meta_dev_folder_paths = model_folder_paths[model_folder_paths_idx[120:180]]
+    meta_test_folder_paths = model_folder_paths[model_folder_paths_idx[180:]]
 
-        for line in f:
-            if line.startswith('-DOCSTART') or line == '' or line == '\n':
-                if new_senetence_tokens:
-                    data_dict['tokens'].append(new_senetence_tokens)
-                    data_dict['ner_tags'].append(new_senetence_ner_tags)
-                    new_senetence_tokens = []
-                    new_senetence_ner_tags = []
-            else:
-                token = line.split()[0]
-                label = line.split()[-1]
-                new_senetence_tokens.append(token)
-                new_senetence_ner_tags.append(label)
-
-        assert len(data_dict['tokens']) == len(data_dict['ner_tags'])   
-
-    return data_dict
+    return {'train': meta_train_folder_paths, 'dev': meta_dev_folder_paths, 'test': meta_test_folder_paths}
 
 
 def seed_everything(seed=42):
@@ -440,7 +514,8 @@ def main():
         os.makedirs(models_dir, exist_ok=True)
 
         # a little trick to seed all 240 models
-        seed = 1000000 + len(glob.glob(os.path.join(models_dir, f'model-*' )))
+        # seed = 1000000 + len(glob.glob(os.path.join(models_dir, f'model-*' )))
+        seed = args.seed
         run["hparams", 'seed'] = seed
         seed_everything(seed)
 
@@ -812,6 +887,684 @@ def main():
         logger.info(f"Json file is saved at {saved_path}")          
 
         logger.info("======================================= Fine Tuning Done! =======================================") 
+
+
+    class Model(nn.Module):
+        def __init__(self, input_size, hidden_size, emb_dim, activation='relu', weighted_sum=0):
+            super(Model, self).__init__()
+
+            act_dict = {'relu': nn.ReLU(),
+            'gelu': nn.GELU()}
+            self.act = act_dict[activation]
+
+            # all features together
+            if weighted_sum == 1:
+                self.n_feature = input_size // 768
+                # weighted sum feature
+                self.softmax_weight = nn.Parameter(torch.empty(768, self.n_feature))
+            self.weighted_sum = weighted_sum
+
+            self.fc1 = nn.Linear(768, hidden_size)
+            self.fc2 = nn.Linear(hidden_size, hidden_size)
+
+            self.fc3 = nn.Linear(emb_dim, hidden_size)
+            self.fc4 = nn.Linear(hidden_size, hidden_size)
+            self.bilinear = nn.Parameter(torch.empty((hidden_size, hidden_size)))
+            self.dropout = nn.Dropout(0.1)
+            self.initialize()
+
+        def initialize(self):
+            nn.init.xavier_normal_(self.bilinear)
+            if self.weighted_sum == 1:
+                nn.init.xavier_normal_(self.softmax_weight)
+
+        def forward(self, repr, emb):
+            # (786) --> (hidden_size)
+            # (512) --> (hidden_size)
+            bz, _ = repr.size()
+            if self.weighted_sum == 1:
+                weight = F.softmax(self.softmax_weight, dim=-1)
+                repr = repr.view(bz, self.n_feature, -1).transpose(1, 2)
+                repr = weight * repr
+                repr = torch.sum(repr, dim=-1)
+
+            out = self.fc1(repr)
+            out = self.dropout(out)
+            out = self.act(out)
+            out = self.fc2(out)
+            out = self.dropout(out)
+            out = self.act(out)
+
+            emb = self.fc3(emb)
+            emb = self.dropout(emb)
+            emb = self.act(emb)
+            emb = self.fc4(emb)
+            emb = self.dropout(emb)
+            emb = self.act(emb).unsqueeze(2)
+
+            res =  out.matmul(self.bilinear).unsqueeze(1)
+            res = res.matmul(emb).squeeze(2)
+
+            return res
+
+
+    class RankNet(nn.Module):
+        def __init__(self, input_size, hidden_size, embedding, activation='gelu', emb_dim=768, weighted_sum=0):
+            super(RankNet, self).__init__()
+            self.lang_embedding = nn.Embedding.from_pretrained(embedding, freeze=True)
+            # load pretrained embedding
+            self.f = Model(input_size, hidden_size, emb_dim, activation, weighted_sum)
+            self.loss = nn.BCELoss()
+
+            
+        def forward(self, repr, repr2, label, lang=None):
+            batchsize, _ = repr.size()
+            lang_emb = self.lang_embedding(lang)
+           
+            si = self.f(repr, lang_emb)
+            sj = self.f(repr2, lang_emb)
+
+            oij = torch.sigmoid(si - sj)
+            label = label.unsqueeze(-1)
+            loss = self.loss(oij, label)
+
+            return loss.mean(), oij.view(-1)
+
+        def evaluate(self, repr, lang=None):
+            lang_emb = self.lang_embedding(lang)
+            out = self.f(repr, lang_emb).view(-1)
+
+            return out    
+
+
+    class LMS_Dataset(Dataset):
+        def __init__(self, split_meta: str, langs: list = None, kendall: bool = False) -> None:
+            self.split_meta = split_meta
+            self.langs = langs 
+            self.kendall = kendall
+            self.lang2id = {'de': 0, 'es': 1, 'nl': 2, 'zh': 3}
+
+            # load model performance table for each target lang on dev set
+            with open(os.path.join(OUTPUT_DIR, 'all_models_evals.json')) as f:
+                self.model_performance_dict = json.load(f)    
+
+            meta_dict = get_meta_splits(OUTPUT_DIR, args.meta_models_split_seed)
+            self.model_paths = meta_dict[self.split_meta]
+
+            paths = []
+
+            if args.lms_validate_on_meta_train_60 == 'yes' and split_meta != 'train':
+                # for ablation study
+                self.model_paths = meta_dict['train'][:60]                            
+
+            if kendall == True:
+                lang = langs[0]
+                for model_path in self.model_paths:
+                    paths.append((model_path, lang))
+
+            else:        
+                for model_path_1 in self.model_paths:
+                    for model_path_2 in self.model_paths:
+                        if model_path_1 != model_path_2:
+                            for lang in langs:
+                                paths.append((model_path_1, model_path_2, lang)) 
+
+            
+            self.paths = paths
+
+        def __len__(self):
+            return len(self.paths)
+
+        def __getitem__(self, idx: int):
+            if self.split_meta == 'test':
+                model_path, lang = self.paths[idx]
+
+                # model_name
+                model_name = model_path.split('/')[-1]
+
+                # [CLS] vector
+                cls_vector = load_vector(model_path + '/cls_' + lang + '_test.npy')
+
+                # Gold rankings
+                test_metric = torch.tensor(self.model_performance_dict[model_name]['Test_' + lang], dtype=torch.float32)
+
+                # lang id
+                lang = torch.tensor(self.lang2id[lang], dtype=torch.int)
+
+                return cls_vector, test_metric, lang, model_name
+
+
+            if self.kendall == True:
+                model_path, lang = self.paths[idx]
+
+                # model_name
+                model_name = model_path.split('/')[-1]
+
+                # [CLS] vector
+                cls_vector = load_vector(model_path + '/cls_' + lang + '_dev.npy')
+
+                # Gold rankings
+                dev_metric = torch.tensor(self.model_performance_dict[model_name]['All-Target_' + lang], dtype=torch.float32)
+
+                # lang id
+                lang = torch.tensor(self.lang2id[lang], dtype=torch.int)
+
+                return cls_vector, dev_metric, lang
+
+            else:
+                model_path_1, model_path_2, lang = self.paths[idx]
+
+                # model names
+                model_1_name = model_path_1.split('/')[-1]
+                model_2_name = model_path_2.split('/')[-1]
+
+                # [CLS] vectors
+                cls_vector_1 = load_vector(model_path_1 + '/cls_' + lang + '_dev.npy')
+                cls_vector_2 = load_vector(model_path_2 + '/cls_' + lang + '_dev.npy')
+
+                # Gold rankings
+                dev_metric_1 = self.model_performance_dict[model_1_name]['All-Target_' + lang]
+                dev_metric_2 = self.model_performance_dict[model_2_name]['All-Target_' + lang]
+
+                if dev_metric_1 == dev_metric_2:
+                    gold_ranking = 0.5
+                elif dev_metric_1 > dev_metric_2:
+                    gold_ranking = 1
+                else:
+                    gold_ranking = 0
+
+                gold_ranking = torch.tensor(gold_ranking, dtype=torch.float32)
+
+                # lang id
+                lang = torch.tensor(self.lang2id[lang], dtype=torch.int)
+
+                return cls_vector_1, cls_vector_2, gold_ranking, lang
+
+           
+    class En_Dev_Dataset(Dataset):
+        def __init__(self, split_meta: str = 'train', langs: list = None, kendall: bool = False) -> None:
+            self.split_meta = split_meta
+            self.langs = langs
+            self.kendall = kendall
+
+            # load model performance table for each target lang on dev set
+            with open(os.path.join(OUTPUT_DIR, 'all_models_evals.json')) as f:
+                self.model_performance_dict = json.load(f)    
+
+            meta_dict = get_meta_splits(OUTPUT_DIR, args.meta_models_split_seed)
+            self.model_paths = meta_dict[self.split_meta]
+
+            paths = []
+
+            if args.lms_validate_on_meta_train_60 == 'yes' and split_meta != 'train':
+                # for ablation study
+                self.model_paths = meta_dict['train'][:60]                            
+
+            if kendall == True:
+                lang = langs[0]
+                for model_path in self.model_paths:
+                    paths.append((model_path, lang))
+
+            else:        
+                for model_path_1 in self.model_paths:
+                    for model_path_2 in self.model_paths:
+                        if model_path_1 != model_path_2:
+                            for lang in langs:
+                                paths.append((model_path_1, model_path_2, lang))        
+
+            self.paths = paths
+
+        def __len__(self):
+            return len(self.paths)
+
+
+        def __getitem__(self, idx: int):
+            if self.kendall == True:
+                model_path, lang = self.paths[idx]
+
+                # model names
+                model_name = model_path.split('/')[-1]
+
+                # dev lang metric
+                dev_metric =  self.model_performance_dict[model_name]['All-Target_' + lang]
+
+                # en lang metric
+                en_dev_metric =  self.model_performance_dict[model_name]['En_Dev']
+
+                return en_dev_metric, dev_metric  
+
+            else:
+                model_path_1, model_path_2, lang = self.paths[idx]
+
+                # model names
+                model_1_name = model_path_1.split('/')[-1]
+                model_2_name = model_path_2.split('/')[-1]
+
+                # gold ranking
+                dev_metric_1 = self.model_performance_dict[model_1_name]['All-Target_' + lang]
+                dev_metric_2 = self.model_performance_dict[model_2_name]['All-Target_' + lang]
+
+                if dev_metric_1 == dev_metric_2:
+                    gold_ranking = 0.5
+                elif dev_metric_1 > dev_metric_2:
+                    gold_ranking = 1
+                else:
+                    gold_ranking = 0 
+
+                # en dev ranking
+                en_dev_metric_1 = self.model_performance_dict[model_1_name]['En_Dev']
+                en_dev_metric_2 = self.model_performance_dict[model_2_name]['En_Dev']
+
+                if en_dev_metric_1 == en_dev_metric_2:
+                    en_dev_ranking = 0.5
+                elif en_dev_metric_1 > en_dev_metric_2:
+                    en_dev_ranking = 1
+                else:
+                    en_dev_ranking = 0
+
+                return en_dev_ranking, gold_ranking        
+
+
+    def train_LMS(batch_size, learning_rate, target_lang, LANGS):
+        logger.info(f"======================================== Target lang ====== {target_lang} =======================================") 
+
+        # Model
+        seed_everything(args.lms_model_seed)
+        lms_model = RankNet(input_size=768, hidden_size=args.lms_hidden_size, embedding=embedding, emb_dim=512, activation='relu')
+        lms_model.to(device)
+
+        # Optimizer
+        optimizer = torch.optim.Adam(lms_model.parameters(), lr=learning_rate)
+
+        # Datasets
+        #############################################  LMS  ############################################   
+        lms_datasets = {}
+        lms_dataloaders = {}
+        PIVOT_LANGS = [l for l in LANGS if l != target_lang]
+
+        # meta-train split models with all languages without target-lang (pivot languages)
+        lms_dataset_train = LMS_Dataset(split_meta='train', langs=PIVOT_LANGS, kendall=False)
+        lms_dataloader_train = DataLoader(lms_dataset_train, shuffle=True, batch_size=batch_size)
+
+        # meta-dev split models with the one language
+        for lang in tqdm(LANGS):
+            lms_datasets[f'kendall_{lang}'] = LMS_Dataset(split_meta='dev', langs=[lang], kendall=True)
+            lms_dataloaders[f'kendall_{lang}'] = DataLoader(lms_datasets[f'kendall_{lang}'], shuffle=False, batch_size=batch_size)
+
+            lms_datasets[f'accuracy_{lang}'] = LMS_Dataset(split_meta='dev', langs=[lang], kendall=False)
+            lms_dataloaders[f'accuracy_{lang}'] = DataLoader(lms_datasets[f'accuracy_{lang}'], shuffle=False, batch_size=batch_size)
+
         
+        ############################################# En - dev #############################################
+        en_dev_datasets = {}
+        en_dev_dataloaders = {}
+
+        for lang in tqdm(LANGS):
+            en_dev_datasets[f'kendall_{lang}'] = En_Dev_Dataset(split_meta='dev', langs=[lang], kendall=True)
+            en_dev_dataloaders[f'kendall_{lang}'] = DataLoader(en_dev_datasets[f'kendall_{lang}'], shuffle=False, batch_size=batch_size)
+
+            en_dev_datasets[f'accuracy_{lang}'] = En_Dev_Dataset(split_meta='dev', langs=[lang], kendall=False)
+            en_dev_dataloaders[f'accuracy_{lang}'] = DataLoader(en_dev_datasets[f'accuracy_{lang}'], shuffle=False, batch_size=batch_size)
+
+        ######################################################################################################
+    
+        iter_num = len(lms_dataloader_train)
+        best_score = -1
+        best_model = None
+
+        for epoch in tqdm(range(args.lms_num_train_epochs)):
+            logger.info(f"Epoch {epoch}")
+            lms_model.train() 
+            correct = 0
+            loss_avg = 0
+
+            for step, batch in enumerate(tqdm(lms_dataloader_train)):
+                # Data
+                lms_model.train() 
+                cls_1, cls_2, gold_rankings, lang = batch
+                cls_1 = cls_1.to(device)
+                cls_2 = cls_2.to(device)
+                gold_rankings = gold_rankings.to(device)
+                lang = lang.to(device)
+
+                # Forward
+                loss, outputs = lms_model(cls_1, cls_2, gold_rankings, lang)
+
+                # Loss
+                loss_avg += loss.item()
+
+                # Accuracy
+                outputs = (outputs > 0.5).float()
+                correct += (outputs == gold_rankings).float().sum().item()
+
+                # Aim track
+                track_step = epoch * iter_num + step
+                run.track(loss.item(), name='Loss', step=track_step, context={"subset": "train"})
+
+                if epoch != 0:
+                    # Backprop and update
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+            
+            # Avg accuracy and kendall 
+            accuracy_avg = 100 * correct / len(lms_dataset_train)  
+
+            # Aim track
+            run.track(accuracy_avg, name=f'Accuracy', step=epoch, context={"subset": "train", "lang": PIVOT_LANGS, 'selected_by': 'lms'})
+
+            
+            lms_model.eval()
+
+            ######################################## LMS Evaluations ####################################################    
+            lms_evals = {}
+
+            for lang in tqdm(LANGS):
+                ### Accuracy
+                correct_dev = 0
+
+                for step, batch in enumerate(tqdm(lms_dataloaders[f'accuracy_{lang}'])):
+                    # Data
+                    cls_1, cls_2, gold_rankings, lang_tensor = batch
+                    cls_1 = cls_1.to(device)
+                    cls_2 = cls_2.to(device)
+                    lang_tensor = lang_tensor.to(device)
+                    gold_rankings = gold_rankings.to(device)
+
+                    # Forward
+                    _, outputs = lms_model(cls_1, cls_2, gold_rankings, lang_tensor)
+
+                    # Accuracy
+                    outputs = (outputs > 0.5).float()
+                    correct_dev += (outputs == gold_rankings).float().sum().item()
+
+                lms_evals[f'accuracy_{lang}'] = 100 * correct_dev / len(lms_datasets[f'accuracy_{lang}'])    
+
+                # Aim track
+                run.track(lms_evals[f'accuracy_{lang}'], name=f'Accuracy', step=epoch, context={"subset": "dev", "lang": lang, 'selected_by': 'lms'})
+
+
+                ### Kendall
+                outputs_arr = []
+                dev_arr = []
+
+                for step, batch in enumerate(tqdm(lms_dataloaders[f'kendall_{lang}'])):
+                    # Data
+                    cls, dev, lang_tensor = batch
+                    cls = cls.to(device)
+                    lang_tensor = lang_tensor.to(device)
+                    dev = dev.to(device)
+
+                    # Predict
+                    with torch.no_grad():
+                        outputs = lms_model.evaluate(cls, lang_tensor)
+
+                    outputs = outputs.detach().cpu().numpy().tolist()
+                    dev = dev.detach().cpu().numpy().tolist()
+
+                    outputs_arr.extend(outputs)
+                    dev_arr.extend(dev) 
+
+                
+                lms_evals[f'kendall_{lang}']  = kendall_rank_correlation(dev_arr, outputs_arr)
+
+                # Aim track
+                run.track(lms_evals[f'kendall_{lang}'], name=f'Kendall', step=epoch, context={"subset": "dev", "lang": lang, 'selected_by': 'lms'})
+
+            # Avg accuracy and kendall 
+            accuracy_avg = sum(lms_evals[f'accuracy_{lang}'] for lang in PIVOT_LANGS) / len(PIVOT_LANGS)
+            kendall_score_avg = sum(lms_evals[f'kendall_{lang}'] for lang in PIVOT_LANGS) / len(PIVOT_LANGS)
+
+            # Aim track
+            run.track(accuracy_avg, name=f'Accuracy', step=epoch, context={"subset": "dev", "lang": PIVOT_LANGS, 'selected_by': 'lms'})
+            run.track(kendall_score_avg, name=f'Kendall', step=epoch, context={"subset": "dev", "lang": PIVOT_LANGS, 'selected_by': 'lms'})
+
+            logger.info("===================== LMS evaluations ===================== ")
+            logger.info(lms_evals)
+            print("average Accuracy", accuracy_avg)
+            print("average Kendall", kendall_score_avg)
+
+
+            # ################################### En Dev Evaluations #####################################################
+            en_dev_baselines = {}
+
+            for lang in tqdm(LANGS):
+                ### Baseline Accuracy
+                correct_en_dev = 0
+                
+                for step, batch in enumerate(tqdm(en_dev_dataloaders[f'accuracy_{lang}'] )):
+                    # Data
+                    en_dev_ranking, gold_ranking = batch
+
+                    # Accuracy
+                    correct_en_dev += (en_dev_ranking == gold_ranking).float().sum().item()   
+                
+                en_dev_baselines[f'accuracy_{lang}'] = 100 * correct_en_dev / len(en_dev_datasets[f'accuracy_{lang}'])
+
+                # Aim track
+                run.track(en_dev_baselines[f'accuracy_{lang}'], name=f'Accuracy', step=epoch, context={"subset": "dev", "lang": lang, 'selected_by': 'en-dev-f1'})
+
+
+                ### Baseline Kendall
+                en_dev_metric_arr = []
+                dev_metric_arr = []
+
+                for step, batch in enumerate(tqdm(en_dev_dataloaders[f'kendall_{lang}'])):
+                    # Data
+                    en_dev_metric, dev_metric = batch
+
+                    # make list 
+                    en_dev_metric = en_dev_metric.detach().cpu().numpy().tolist()
+                    dev_metric = dev_metric.detach().cpu().numpy().tolist()
+
+                    # append
+                    en_dev_metric_arr.extend(en_dev_metric)
+                    dev_metric_arr.extend(dev_metric) 
+            
+                en_dev_baselines[f'kendall_{lang}'] = kendall_rank_correlation(en_dev_metric_arr, dev_metric_arr)
+
+                # Aim track
+                run.track(en_dev_baselines[f'kendall_{lang}'], name=f'Kendall', step=epoch, context={"subset": "dev", "lang": lang, 'selected_by': 'en-dev-f1'})
+
+            # Avg accuracy and kendall 
+            accuracy_avg = sum(en_dev_baselines[f'accuracy_{lang}'] for lang in PIVOT_LANGS) / len(PIVOT_LANGS)
+            kendall_score_avg = sum(en_dev_baselines[f'kendall_{lang}'] for lang in PIVOT_LANGS) / len(PIVOT_LANGS)
+
+            # Aim track
+            run.track(accuracy_avg, name=f'Accuracy', step=epoch, context={"subset": "dev", "lang": PIVOT_LANGS, 'selected_by': 'en-dev-f1'})
+            run.track(kendall_score_avg, name=f'Kendall', step=epoch, context={"subset": "dev", "lang": PIVOT_LANGS, 'selected_by': 'en-dev-f1'})
+            
+            logger.info("===================== En baseline evaluations ===================== ")
+            logger.info(en_dev_baselines) 
+            print("average Accuracy", accuracy_avg)
+            print("average Kendall", kendall_score_avg) 
+
+            # best score across epochs
+            if lms_evals[f'kendall_{target_lang}'] > best_score:
+                best_score = lms_evals[f'kendall_{target_lang}']
+                best_model = lms_model
+                
+
+        return best_score, best_model        
+
+
+    if args.do_lms_hyperparam_search:
+        # Str convert to float    
+        learning_rates = [float(i) for i in args.lms_learning_rates]   
+        batch_sizes = [int(i) for i in args.lms_batch_sizes]   
+
+        logger.info("======================================= Hyperparameter search =======================================")
+        logger.info(f"Hyperparameters")
+        logger.info(f'Target language {args.lms_target_lang}')
+        logger.info(f'Learning rates {learning_rates}')
+        logger.info(f'Batch size {batch_sizes}')
+        logger.info(f'Hidden size {args.lms_hidden_size}')
+        logger.info(f'Train epochs {args.lms_num_train_epochs}')
+        logger.info(f'LMS Model seed {args.lms_model_seed}')
+        logger.info(f'Validate on meta-train split {args.lms_validate_on_meta_train_60}')
+
+        # Output folder for LMS models
+        LMS_models_dir = os.path.join(OUTPUT_DIR, 'LMS_models')
+        os.makedirs(LMS_models_dir, exist_ok=True)    
+
+        # TASK Language Dic
+        lang_dic = {'deu': 0, 'spa': 1, 'nld': 2, 'zho': 3}
+
+        embedding = [[] for _ in range(len(lang_dic))]
+        emb = np.load("lang_vecs.npy", allow_pickle=True, encoding='latin1')
+
+        for k, v in lang_dic.items():
+            embedding[v] = emb.item()['optsrc' + k]
+
+        embedding = torch.FloatTensor(np.array(embedding))
+
+        # For cross-validation we choose one lang besides target language as fake target language
+        FAKE_TARGET_LANGS = [l for l in TARGET_LANGS if l != args.lms_target_lang]
+
+        for batch_size in batch_sizes:
+            for learning_rate in learning_rates:
+
+                cross_val_score = 0
+
+                for fake_target_lang in tqdm(FAKE_TARGET_LANGS):
+                    # return the best score for each fake target language through epochs
+                    best_score, _ = train_LMS(batch_size, learning_rate, fake_target_lang, FAKE_TARGET_LANGS)
+
+                    # aggregate best score for the unseen target language (args.lms_target_lang)
+                    cross_val_score += best_score 
+                
+                cross_val_score = cross_val_score / len(FAKE_TARGET_LANGS)
+
+                logger.info(f'Cross validation {args.lms_target_lang} language score {cross_val_score} with bs={batch_size} and lr={learning_rate}')
+   
+                csv_row = [batch_size, learning_rate, cross_val_score]
+
+                with open(LMS_models_dir + f'/meta_dev_scores_{args.lms_target_lang}.csv', 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(csv_row)  
+
+        
+        logger.info("======================================= Hyperparam choose Done! =======================================")
+
+
+    if args.do_lms_train:
+        logger.info("======================================= Train LMS =======================================")
+        # Output folder for LMS models
+        LMS_models_dir = os.path.join(OUTPUT_DIR, 'LMS_models')
+        os.makedirs(LMS_models_dir, exist_ok=True)
+
+        # TASK Language Dict
+        lang_dic = {'deu': 0, 'spa': 1, 'nld': 2, 'zho': 3}
+
+        embedding = [[] for _ in range(len(lang_dic))]
+        emb = np.load("lang_vecs.npy", allow_pickle=True, encoding='latin1')
+        for k, v in lang_dic.items():
+            embedding[v] = emb.item()['optsrc' + k]
+
+        embedding = torch.FloatTensor(np.array(embedding))
+
+        for target_lang in tqdm(TARGET_LANGS):
+            if args.lms_batch_size is not None and args.lms_learning_rate is not None:
+                lms_batch_size = args.lms_batch_size
+                lms_learning_rate = args.lms_learning_rate
+            else:
+                # Getting the best hyperparameters
+                df = pd.read_csv(LMS_models_dir + f'/meta_dev_scores_{target_lang}.csv', names=['batch_size', 'learning_rate', 'cv_score'])
+                df_max = df[df['cv_score'] == df['cv_score'].max()]
+                print(df_max)
+
+                lms_batch_size = df_max['batch_size'].item()
+                lms_learning_rate = df_max['learning_rate'].item()
+
+           
+            # return the best score and model for each target language through epochs
+            best_score, best_model = train_LMS(lms_batch_size, lms_learning_rate, target_lang, TARGET_LANGS)
+            logger.info(f"Best LMS score {best_score}")
+
+                
+            torch.save(best_model.state_dict(), LMS_models_dir + f'/model_{target_lang}.pth')
+
+        logger.info("======================================= Train LMS Done! =======================================")
+
+
+    if args.do_lms_predict:
+        logger.info("======================================= Predict score with LMS =======================================")  
+        # Output folder for LMS models
+        LMS_models_dir = os.path.join(OUTPUT_DIR, 'LMS_models')
+        
+        # TASK Language Dic
+        lang_dic = {'deu': 0, 'spa': 1, 'nld': 2, 'zho': 3}
+
+        embedding = [[] for _ in range(len(lang_dic))]
+        emb = np.load("lang_vecs.npy", allow_pickle=True, encoding='latin1')
+        for k, v in lang_dic.items():
+            embedding[v] = emb.item()['optsrc' + k]
+
+        embedding = torch.FloatTensor(np.array(embedding))
+
+        target_lang = args.lms_target_lang
+        lms_evals = {}
+        
+        for target_lang in [target_lang]:
+        # for target_lang in TARGET_LANGS:
+            print(f"======================================= Target lang ====== {target_lang} =======================================")
+            # Getting the best hyperparameters
+            df = pd.read_csv(LMS_models_dir + f'/meta_dev_scores_{target_lang}.csv', names=['batch_size', 'learning_rate', 'cv_score'])
+            df_max = df[df['cv_score'] == df['cv_score'].max()]
+            print(df_max)
+
+            lms_batch_size = df_max['batch_size'].item()
+
+           
+            # Model
+            seed_everything(args.lms_model_seed)
+            lms_model_path = LMS_models_dir + f'/model_{target_lang}.pth'
+            lms_model = RankNet(input_size=512, hidden_size=args.lms_hidden_size, embedding=embedding, emb_dim=512, activation='relu')
+            lms_model.to(device)
+
+            checkpoint = torch.load(lms_model_path, map_location=device)
+            lms_model.load_state_dict(checkpoint)
+            lms_model.eval()
+
+            # Dataset
+            lms_dataset_test = LMS_Dataset(split_meta='test', langs=[target_lang], kendall=True)
+            lms_test_dataloader = DataLoader(lms_dataset_test, shuffle=False, batch_size=lms_batch_size)
+
+            ### Kendall
+            outputs_arr = []
+            test_arr = []
+            model_names = []
+
+            for step, batch in enumerate(tqdm(lms_test_dataloader)):
+                # Data
+                cls, test_metric, lang_tensor, model_name = batch
+                cls = cls.to(device)
+                lang_tensor = lang_tensor.to(device)
+                test_metric = test_metric.to(device)
+
+                # Predict
+                with torch.no_grad():
+                    outputs = lms_model.evaluate(cls, lang_tensor)
+
+                outputs = outputs.detach().cpu().numpy().tolist()
+                test_metric = test_metric.detach().cpu().numpy().tolist()
+
+                outputs_arr.extend(outputs)
+                test_arr.extend(test_metric) 
+                model_names += list(model_name)
+
+                
+            lms_evals[f'kendall_{target_lang}']  = kendall_rank_correlation(test_arr, outputs_arr)
+
+            # Aim track
+            run.track(lms_evals[f'kendall_{target_lang}'], name=f'Kendall', step=0, context={"subset": "test", "lang": target_lang, 'selected_by': 'lms'})
+
+            scores_df = pd.DataFrame({'model_name': model_names, 'score': outputs_arr, f'test_{METRIC}': test_arr})
+            scores_df = scores_df.sort_values('score')
+            scores_df.to_csv(LMS_models_dir + f'/meta_test_scores_{target_lang}.csv', index=False)
+   
+        logger.info("======================================= Predict score with LMS Done! =======================================")     
+
+
 if __name__ == "__main__":
     main()
