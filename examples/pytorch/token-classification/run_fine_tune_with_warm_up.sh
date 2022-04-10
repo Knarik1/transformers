@@ -24,7 +24,7 @@ do
     do
       accelerate launch run_ner_no_trainer.py \
           --experiment_description 'Fine-tune with warm-up' \
-          --output_dir /mnt/xtb/knarik/outputs/$TASK_NAME \
+          --output_dir /mnt/xtb/knarik/outputs/new_low_kendall \
           --data_dir data/$TASK_NAME \
           --task_name $TASK_NAME \
           --model_name_or_path bert-base-multilingual-cased \

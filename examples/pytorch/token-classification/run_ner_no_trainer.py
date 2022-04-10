@@ -225,7 +225,7 @@ def parse_args():
 
     # local arguments
     parser.add_argument("--data_dir", type=str, default='data', help='Path to your task data.')
-    parser.add_argument("--experiment_description", type=str, default='Fine tune', help="Experiment.")
+    parser.add_argument("--experiment_description", type=str, help="Experiment.")
     parser.add_argument('--meta_models_split_seed', type=int, help="Meta train/dev/test fine tuned models' split seed.")
     parser.add_argument('--saved_epoch', type=int, default=2, help="Which epochs of the model to save.")
     parser.add_argument("--do_fine_tune", action="store_true", help="Fine tune")
@@ -234,16 +234,14 @@ def parse_args():
     parser.add_argument("--do_lms_predict", action="store_true", help="Predict")
     parser.add_argument("--do_en_cls", action="store_true", help="En feature extraction")
     parser.add_argument('--warmup_proportion', type=float, help="Fine tune warm up.")
-    parser.add_argument("--lms_num_train_epochs", type=int, default=3, help="Total number of training epochs to perform in LMS.")
+    parser.add_argument("--lms_num_train_epochs", type=int, help="Total number of training epochs to perform in LMS.")
     parser.add_argument("--lms_learning_rate", type=float, help="Learning rate in LMS.")
     parser.add_argument('--lms_learning_rates', nargs='+', help="Learning rates in LMS.")
     parser.add_argument("--lms_hidden_size", type=int, help="Hidden size in LMS.")
     parser.add_argument("--lms_batch_size", type=int, help="Batch size in LMS.")
     parser.add_argument("--lms_batch_sizes", nargs='+', help="Batch sizes in LMS.")
-    parser.add_argument("--lms_target_lang", type=str, default='es', help="Target language in LMS.")
+    parser.add_argument("--lms_target_lang", type=str, help="Target language in LMS.")
     parser.add_argument("--lms_model_seed", type=int, help="Model seed in LMS.")
-    parser.add_argument("--lms_validate_on_meta_train_60", type=str, default='no', help="Weather to validate on meta train[:60] or dev split in LMS.")
-
 
     args = parser.parse_args()
 
@@ -666,7 +664,7 @@ def main():
                     # ignored in the loss function.
                     if word_idx is None:
                         label_ids.append(-100)
-                    # We set the label for the first token of each word.
+                    # We set the labelrun for the first token of each word.
                     elif word_idx != previous_word_idx:
                         try:
                             label_ids.append(label_to_id[label[word_idx]])
@@ -939,10 +937,10 @@ def main():
             out = self.act(out)
 
             emb = self.fc3(emb)
-            emb = self.dropout(emb)
+            out = self.dropout(out)
             emb = self.act(emb)
             emb = self.fc4(emb)
-            emb = self.dropout(emb)
+            out = self.dropout(out)
             emb = self.act(emb).unsqueeze(2)
 
             res =  out.matmul(self.bilinear).unsqueeze(1)
@@ -994,11 +992,7 @@ def main():
             meta_dict = get_meta_splits(OUTPUT_DIR, args.meta_models_split_seed)
             self.model_paths = meta_dict[self.split_meta]
 
-            paths = []
-
-            if args.lms_validate_on_meta_train_60 == 'yes' and split_meta != 'train':
-                # for ablation study
-                self.model_paths = meta_dict['train'][:60]                            
+            paths = []                           
 
             if kendall == True:
                 lang = langs[0]
@@ -1019,6 +1013,7 @@ def main():
             return len(self.paths)
 
         def __getitem__(self, idx: int):
+
             if self.split_meta == 'test':
                 model_path, lang = self.paths[idx]
 
@@ -1026,15 +1021,17 @@ def main():
                 model_name = model_path.split('/')[-1]
 
                 # [CLS] vector
-                cls_vector = load_vector(model_path + '/cls_' + lang + '_test.npy')
+                cls_vector = load_vector(model_path + '/cls_' + lang + '_dev.npy')
+                # cls_vector = load_vector(model_path + '/cls_' + lang + '_test.npy')
 
                 # Gold rankings
-                test_metric = torch.tensor(self.model_performance_dict[model_name]['Test_' + lang], dtype=torch.float32)
+                dev_metric = torch.tensor(self.model_performance_dict[model_name]['All-Target_' + lang], dtype=torch.float32)
+                # test_metric = torch.tensor(self.model_performance_dict[model_name]['Test_' + lang], dtype=torch.float32)
 
                 # lang id
                 lang = torch.tensor(self.lang2id[lang], dtype=torch.int)
 
-                return cls_vector, test_metric, lang, model_name
+                return cls_vector, dev_metric, lang, model_name
 
 
             if self.kendall == True:
@@ -1097,11 +1094,7 @@ def main():
             meta_dict = get_meta_splits(OUTPUT_DIR, args.meta_models_split_seed)
             self.model_paths = meta_dict[self.split_meta]
 
-            paths = []
-
-            if args.lms_validate_on_meta_train_60 == 'yes' and split_meta != 'train':
-                # for ablation study
-                self.model_paths = meta_dict['train'][:60]                            
+            paths = []                          
 
             if kendall == True:
                 lang = langs[0]
@@ -1168,7 +1161,75 @@ def main():
                 return en_dev_ranking, gold_ranking        
 
 
-    def train_LMS(batch_size, learning_rate, target_lang, LANGS):
+    def evaluate_en_dev(LANGS, PIVOT_LANGS, batch_size):
+        # calculates en-dev f1 against target-dev f1 with kendall and accuracy
+        en_dev_datasets = {}
+        en_dev_dataloaders = {}
+        en_dev_baselines = {}
+
+        for lang in tqdm(LANGS):
+            en_dev_datasets[f'kendall_{lang}'] = En_Dev_Dataset(split_meta='dev', langs=[lang], kendall=True)
+            en_dev_dataloaders[f'kendall_{lang}'] = DataLoader(en_dev_datasets[f'kendall_{lang}'], shuffle=False, batch_size=batch_size)
+
+            en_dev_datasets[f'accuracy_{lang}'] = En_Dev_Dataset(split_meta='dev', langs=[lang], kendall=False)
+            en_dev_dataloaders[f'accuracy_{lang}'] = DataLoader(en_dev_datasets[f'accuracy_{lang}'], shuffle=False, batch_size=batch_size)
+
+            ### Baseline Accuracy
+            correct_en_dev = 0
+            
+            for step, batch in enumerate(tqdm(en_dev_dataloaders[f'accuracy_{lang}'] )):
+                # Data
+                en_dev_ranking, gold_ranking = batch
+
+                # Accuracy
+                correct_en_dev += (en_dev_ranking == gold_ranking).float().sum().item()   
+            
+            en_dev_baselines[f'accuracy_{lang}'] = 100 * correct_en_dev / len(en_dev_datasets[f'accuracy_{lang}'])
+
+            # Aim track
+            run.track(en_dev_baselines[f'accuracy_{lang}'], name=f'Accuracy', step=0, context={"subset": "dev", "lang": lang, 'selected_by': 'en-dev-f1'})
+            run.track(en_dev_baselines[f'accuracy_{lang}'], name=f'Accuracy', step=args.lms_num_train_epochs-1, context={"subset": "dev", "lang": lang, 'selected_by': 'en-dev-f1'})
+
+
+            ### Baseline Kendall
+            en_dev_metric_arr = []
+            dev_metric_arr = []
+
+            for step, batch in enumerate(tqdm(en_dev_dataloaders[f'kendall_{lang}'])):
+                # Data
+                en_dev_metric, dev_metric = batch
+
+                # make list 
+                en_dev_metric = en_dev_metric.detach().cpu().numpy().tolist()
+                dev_metric = dev_metric.detach().cpu().numpy().tolist()
+
+                # append
+                en_dev_metric_arr.extend(en_dev_metric)
+                dev_metric_arr.extend(dev_metric) 
+        
+            en_dev_baselines[f'kendall_{lang}'] = kendall_rank_correlation(en_dev_metric_arr, dev_metric_arr)
+
+            # Aim track
+            run.track(en_dev_baselines[f'kendall_{lang}'], name=f'Kendall', step=0, context={"subset": "dev", "lang": lang, 'selected_by': 'en-dev-f1'})
+            run.track(en_dev_baselines[f'kendall_{lang}'], name=f'Kendall', step=args.lms_num_train_epochs-1, context={"subset": "dev", "lang": lang, 'selected_by': 'en-dev-f1'})
+
+        # Avg accuracy and kendall 
+        accuracy_avg = sum(en_dev_baselines[f'accuracy_{lang}'] for lang in PIVOT_LANGS) / len(PIVOT_LANGS)
+        kendall_score_avg = sum(en_dev_baselines[f'kendall_{lang}'] for lang in PIVOT_LANGS) / len(PIVOT_LANGS)
+
+        # Aim track
+        run.track(accuracy_avg, name=f'Accuracy', step=0, context={"subset": "dev", "lang": PIVOT_LANGS, 'selected_by': 'en-dev-f1'})
+        run.track(accuracy_avg, name=f'Accuracy', step=args.lms_num_train_epochs-1, context={"subset": "dev", "lang": PIVOT_LANGS, 'selected_by': 'en-dev-f1'})
+        run.track(kendall_score_avg, name=f'Kendall', step=0, context={"subset": "dev", "lang": PIVOT_LANGS, 'selected_by': 'en-dev-f1'})
+        run.track(kendall_score_avg, name=f'Kendall', step=args.lms_num_train_epochs-1, context={"subset": "dev", "lang": PIVOT_LANGS, 'selected_by': 'en-dev-f1'})
+        
+        logger.info("===================== En baseline evaluations ===================== ")
+        logger.info(en_dev_baselines) 
+        print("average Accuracy", accuracy_avg)
+        print("average Kendall", kendall_score_avg)     
+
+
+    def train_LMS(batch_size, learning_rate, target_lang, LANGS, train=False):
         logger.info(f"======================================== Target lang ====== {target_lang} =======================================") 
 
         # Model
@@ -1198,18 +1259,8 @@ def main():
             lms_dataloaders[f'accuracy_{lang}'] = DataLoader(lms_datasets[f'accuracy_{lang}'], shuffle=False, batch_size=batch_size)
 
         
-        ############################################# En - dev #############################################
-        en_dev_datasets = {}
-        en_dev_dataloaders = {}
-
-        for lang in tqdm(LANGS):
-            en_dev_datasets[f'kendall_{lang}'] = En_Dev_Dataset(split_meta='dev', langs=[lang], kendall=True)
-            en_dev_dataloaders[f'kendall_{lang}'] = DataLoader(en_dev_datasets[f'kendall_{lang}'], shuffle=False, batch_size=batch_size)
-
-            en_dev_datasets[f'accuracy_{lang}'] = En_Dev_Dataset(split_meta='dev', langs=[lang], kendall=False)
-            en_dev_dataloaders[f'accuracy_{lang}'] = DataLoader(en_dev_datasets[f'accuracy_{lang}'], shuffle=False, batch_size=batch_size)
-
-        ######################################################################################################
+        #############################################  En Dev  ############################################
+        evaluate_en_dev(LANGS, PIVOT_LANGS, batch_size)
     
         iter_num = len(lms_dataloader_train)
         best_score = -1
@@ -1327,90 +1378,36 @@ def main():
             print("average Accuracy", accuracy_avg)
             print("average Kendall", kendall_score_avg)
 
-
-            # ################################### En Dev Evaluations #####################################################
-            en_dev_baselines = {}
-
-            for lang in tqdm(LANGS):
-                ### Baseline Accuracy
-                correct_en_dev = 0
-                
-                for step, batch in enumerate(tqdm(en_dev_dataloaders[f'accuracy_{lang}'] )):
-                    # Data
-                    en_dev_ranking, gold_ranking = batch
-
-                    # Accuracy
-                    correct_en_dev += (en_dev_ranking == gold_ranking).float().sum().item()   
-                
-                en_dev_baselines[f'accuracy_{lang}'] = 100 * correct_en_dev / len(en_dev_datasets[f'accuracy_{lang}'])
-
-                # Aim track
-                run.track(en_dev_baselines[f'accuracy_{lang}'], name=f'Accuracy', step=epoch, context={"subset": "dev", "lang": lang, 'selected_by': 'en-dev-f1'})
-
-
-                ### Baseline Kendall
-                en_dev_metric_arr = []
-                dev_metric_arr = []
-
-                for step, batch in enumerate(tqdm(en_dev_dataloaders[f'kendall_{lang}'])):
-                    # Data
-                    en_dev_metric, dev_metric = batch
-
-                    # make list 
-                    en_dev_metric = en_dev_metric.detach().cpu().numpy().tolist()
-                    dev_metric = dev_metric.detach().cpu().numpy().tolist()
-
-                    # append
-                    en_dev_metric_arr.extend(en_dev_metric)
-                    dev_metric_arr.extend(dev_metric) 
-            
-                en_dev_baselines[f'kendall_{lang}'] = kendall_rank_correlation(en_dev_metric_arr, dev_metric_arr)
-
-                # Aim track
-                run.track(en_dev_baselines[f'kendall_{lang}'], name=f'Kendall', step=epoch, context={"subset": "dev", "lang": lang, 'selected_by': 'en-dev-f1'})
-
-            # Avg accuracy and kendall 
-            accuracy_avg = sum(en_dev_baselines[f'accuracy_{lang}'] for lang in PIVOT_LANGS) / len(PIVOT_LANGS)
-            kendall_score_avg = sum(en_dev_baselines[f'kendall_{lang}'] for lang in PIVOT_LANGS) / len(PIVOT_LANGS)
-
-            # Aim track
-            run.track(accuracy_avg, name=f'Accuracy', step=epoch, context={"subset": "dev", "lang": PIVOT_LANGS, 'selected_by': 'en-dev-f1'})
-            run.track(kendall_score_avg, name=f'Kendall', step=epoch, context={"subset": "dev", "lang": PIVOT_LANGS, 'selected_by': 'en-dev-f1'})
-            
-            logger.info("===================== En baseline evaluations ===================== ")
-            logger.info(en_dev_baselines) 
-            print("average Accuracy", accuracy_avg)
-            print("average Kendall", kendall_score_avg) 
-
             # best score across epochs
-            if lms_evals[f'kendall_{target_lang}'] > best_score:
-                best_score = lms_evals[f'kendall_{target_lang}']
-                best_model = lms_model
+            if train:
+                if kendall_score_avg > best_score:
+                    best_score = kendall_score_avg
+                    best_model = lms_model
+
+            else:    
+                if lms_evals[f'kendall_{target_lang}'] > best_score:
+                    best_score = lms_evals[f'kendall_{target_lang}']
+                    best_model = lms_model
                 
 
         return best_score, best_model        
 
 
     if args.do_lms_hyperparam_search:
-        # Str convert to float    
-        learning_rates = [float(i) for i in args.lms_learning_rates]   
-        batch_sizes = [int(i) for i in args.lms_batch_sizes]   
-
         logger.info("======================================= Hyperparameter search =======================================")
         logger.info(f"Hyperparameters")
         logger.info(f'Target language {args.lms_target_lang}')
-        logger.info(f'Learning rates {learning_rates}')
-        logger.info(f'Batch size {batch_sizes}')
+        logger.info(f'Learning rate {args.lms_learning_rate}')
+        logger.info(f'Batch size {args.lms_batch_size}')
         logger.info(f'Hidden size {args.lms_hidden_size}')
         logger.info(f'Train epochs {args.lms_num_train_epochs}')
         logger.info(f'LMS Model seed {args.lms_model_seed}')
-        logger.info(f'Validate on meta-train split {args.lms_validate_on_meta_train_60}')
 
         # Output folder for LMS models
         LMS_models_dir = os.path.join(OUTPUT_DIR, 'LMS_models')
         os.makedirs(LMS_models_dir, exist_ok=True)    
 
-        # TASK Language Dic
+        ##################### Lang2vec embeddings #####################
         lang_dic = {'deu': 0, 'spa': 1, 'nld': 2, 'zho': 3}
 
         embedding = [[] for _ in range(len(lang_dic))]
@@ -1420,31 +1417,31 @@ def main():
             embedding[v] = emb.item()['optsrc' + k]
 
         embedding = torch.FloatTensor(np.array(embedding))
+        ###############################################################
 
         # For cross-validation we choose one lang besides target language as fake target language
         FAKE_TARGET_LANGS = [l for l in TARGET_LANGS if l != args.lms_target_lang]
 
-        for batch_size in batch_sizes:
-            for learning_rate in learning_rates:
+        cross_val_score = 0
 
-                cross_val_score = 0
+        for fake_target_lang in tqdm(FAKE_TARGET_LANGS):
+            run["hparams", 'lms_fake_target_lang'] = fake_target_lang
 
-                for fake_target_lang in tqdm(FAKE_TARGET_LANGS):
-                    # return the best score for each fake target language through epochs
-                    best_score, _ = train_LMS(batch_size, learning_rate, fake_target_lang, FAKE_TARGET_LANGS)
+            # return the best score for each fake target language through epochs
+            best_score, _ = train_LMS(args.lms_batch_size, args.lms_learning_rate, fake_target_lang, FAKE_TARGET_LANGS)
 
-                    # aggregate best score for the unseen target language (args.lms_target_lang)
-                    cross_val_score += best_score 
-                
-                cross_val_score = cross_val_score / len(FAKE_TARGET_LANGS)
+            # aggregate best score for the unseen target language (args.lms_target_lang)
+            cross_val_score += best_score 
+        
+        cross_val_score = cross_val_score / len(FAKE_TARGET_LANGS)
 
-                logger.info(f'Cross validation {args.lms_target_lang} language score {cross_val_score} with bs={batch_size} and lr={learning_rate}')
-   
-                csv_row = [batch_size, learning_rate, cross_val_score]
+        logger.info(f'Cross validation {args.lms_target_lang} language score {cross_val_score} with bs={args.lms_batch_size} and lr={args.lms_learning_rate}')
 
-                with open(LMS_models_dir + f'/meta_dev_scores_{args.lms_target_lang}.csv', 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(csv_row)  
+        csv_row = [args.lms_batch_size, args.lms_learning_rate, cross_val_score]
+
+        with open(LMS_models_dir + f'/meta_dev_scores_{args.lms_target_lang}.csv', 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(csv_row)  
 
         
         logger.info("======================================= Hyperparam choose Done! =======================================")
@@ -1452,11 +1449,19 @@ def main():
 
     if args.do_lms_train:
         logger.info("======================================= Train LMS =======================================")
+        logger.info(f"Hyperparameters")
+        logger.info(f'Target language {args.lms_target_lang}')
+        logger.info(f'Learning rate {args.lms_learning_rate}')
+        logger.info(f'Batch size {args.lms_batch_size}')
+        logger.info(f'Hidden size {args.lms_hidden_size}')
+        logger.info(f'Train epochs {args.lms_num_train_epochs}')
+        logger.info(f'LMS Model seed {args.lms_model_seed}')
+
         # Output folder for LMS models
         LMS_models_dir = os.path.join(OUTPUT_DIR, 'LMS_models')
         os.makedirs(LMS_models_dir, exist_ok=True)
 
-        # TASK Language Dict
+        ##################### Lang2vec embeddings #####################
         lang_dic = {'deu': 0, 'spa': 1, 'nld': 2, 'zho': 3}
 
         embedding = [[] for _ in range(len(lang_dic))]
@@ -1465,26 +1470,29 @@ def main():
             embedding[v] = emb.item()['optsrc' + k]
 
         embedding = torch.FloatTensor(np.array(embedding))
+        ###############################################################
 
-        for target_lang in tqdm(TARGET_LANGS):
+        target_langs = [args.lms_target_lang] if args.lms_target_lang else TARGET_LANGS
+
+        for target_lang in tqdm(target_langs):
             if args.lms_batch_size is not None and args.lms_learning_rate is not None:
                 lms_batch_size = args.lms_batch_size
                 lms_learning_rate = args.lms_learning_rate
             else:
                 # Getting the best hyperparameters
                 df = pd.read_csv(LMS_models_dir + f'/meta_dev_scores_{target_lang}.csv', names=['batch_size', 'learning_rate', 'cv_score'])
-                df_max = df[df['cv_score'] == df['cv_score'].max()]
+                
+                # get the first row even if there are more with the same score
+                df_max = df[df['cv_score'] == df['cv_score'].max()].iloc[:1]
                 print(df_max)
 
                 lms_batch_size = df_max['batch_size'].item()
                 lms_learning_rate = df_max['learning_rate'].item()
-
-           
+ 
             # return the best score and model for each target language through epochs
-            best_score, best_model = train_LMS(lms_batch_size, lms_learning_rate, target_lang, TARGET_LANGS)
-            logger.info(f"Best LMS score {best_score}")
+            best_score, best_model = train_LMS(lms_batch_size, lms_learning_rate, target_lang, TARGET_LANGS, train=True)
+            logger.info(f"Target {args.lms_target_lang} Dev split best LMS score {best_score}")
 
-                
             torch.save(best_model.state_dict(), LMS_models_dir + f'/model_{target_lang}.pth')
 
         logger.info("======================================= Train LMS Done! =======================================")
@@ -1495,7 +1503,7 @@ def main():
         # Output folder for LMS models
         LMS_models_dir = os.path.join(OUTPUT_DIR, 'LMS_models')
         
-        # TASK Language Dic
+        ##################### Lang2vec embeddings #####################
         lang_dic = {'deu': 0, 'spa': 1, 'nld': 2, 'zho': 3}
 
         embedding = [[] for _ in range(len(lang_dic))]
@@ -1504,6 +1512,7 @@ def main():
             embedding[v] = emb.item()['optsrc' + k]
 
         embedding = torch.FloatTensor(np.array(embedding))
+        ###############################################################
 
         target_lang = args.lms_target_lang
         lms_evals = {}
@@ -1513,12 +1522,11 @@ def main():
             print(f"======================================= Target lang ====== {target_lang} =======================================")
             # Getting the best hyperparameters
             df = pd.read_csv(LMS_models_dir + f'/meta_dev_scores_{target_lang}.csv', names=['batch_size', 'learning_rate', 'cv_score'])
-            df_max = df[df['cv_score'] == df['cv_score'].max()]
+            df_max = df[df['cv_score'] == df['cv_score'].max()].iloc[:1]
             print(df_max)
 
             lms_batch_size = df_max['batch_size'].item()
 
-           
             # Model
             seed_everything(args.lms_model_seed)
             lms_model_path = LMS_models_dir + f'/model_{target_lang}.pth'
@@ -1535,37 +1543,38 @@ def main():
 
             ### Kendall
             outputs_arr = []
-            test_arr = []
+            dev_arr = []
             model_names = []
 
             for step, batch in enumerate(tqdm(lms_test_dataloader)):
                 # Data
-                cls, test_metric, lang_tensor, model_name = batch
+                cls, dev_metric, lang_tensor, model_name = batch
                 cls = cls.to(device)
                 lang_tensor = lang_tensor.to(device)
-                test_metric = test_metric.to(device)
+                dev_metric = dev_metric.to(device)
 
                 # Predict
                 with torch.no_grad():
                     outputs = lms_model.evaluate(cls, lang_tensor)
 
                 outputs = outputs.detach().cpu().numpy().tolist()
-                test_metric = test_metric.detach().cpu().numpy().tolist()
+                dev_metric = dev_metric.detach().cpu().numpy().tolist()
 
                 outputs_arr.extend(outputs)
-                test_arr.extend(test_metric) 
+                dev_arr.extend(dev_metric) 
                 model_names += list(model_name)
-
                 
-            lms_evals[f'kendall_{target_lang}']  = kendall_rank_correlation(test_arr, outputs_arr)
+            lms_evals[f'kendall_{target_lang}']  = kendall_rank_correlation(dev_arr, outputs_arr)
+            logger.info(f"Target {args.lms_target_lang} Test split LMS score {lms_evals[f'kendall_{target_lang}']}")
 
             # Aim track
             run.track(lms_evals[f'kendall_{target_lang}'], name=f'Kendall', step=0, context={"subset": "test", "lang": target_lang, 'selected_by': 'lms'})
 
-            scores_df = pd.DataFrame({'model_name': model_names, 'score': outputs_arr, f'test_{METRIC}': test_arr})
+            scores_df = pd.DataFrame({'model_name': model_names, 'score': outputs_arr, f'test_{METRIC}': dev_arr})
             scores_df = scores_df.sort_values('score')
             scores_df.to_csv(LMS_models_dir + f'/meta_test_scores_{target_lang}.csv', index=False)
-   
+
+
         logger.info("======================================= Predict score with LMS Done! =======================================")     
 
 

@@ -12,13 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-export CUDA_VISIBLE_DEVICES=1
+# for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+# do
+#   for BATCH_SIZE in 32 4
+#   do
+#     for LR in 1e-1 5e-2 1e-2 5e-3 1e-3 5e-4 1e-4 7e-5 5e-5 3e-5 5e-6 1e-6 5e-7 1e-7
+#     do
+#       for SAVED_EPOCH in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20
+
+export CUDA_VISIBLE_DEVICES=0
 export TASK_NAME=ner
 
 
-for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+for i in 0 1 2 3 4 5
 do
-  for BATCH_SIZE in 32 4
+  for BATCH_SIZE in 4 32
   do
     for LR in 1e-1 5e-2 1e-2 5e-3 1e-3 5e-4 1e-4 7e-5 5e-5 3e-5 5e-6 1e-6 5e-7 1e-7
     do

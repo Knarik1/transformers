@@ -161,3 +161,7 @@ tags
 
 # .lock
 *.lock
+
+examples/pytorch/token-classification/.aim
+examples/pytorch/token-classification/data
+
