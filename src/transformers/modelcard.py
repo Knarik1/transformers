@@ -28,20 +28,6 @@ import yaml
 from huggingface_hub import model_info
 
 from . import __version__
-from .file_utils import (
-    CONFIG_NAME,
-    MODEL_CARD_NAME,
-    TF2_WEIGHTS_NAME,
-    WEIGHTS_NAME,
-    cached_path,
-    hf_bucket_url,
-    is_datasets_available,
-    is_offline_mode,
-    is_remote_url,
-    is_tf_available,
-    is_tokenizers_available,
-    is_torch_available,
-)
 from .models.auto.modeling_auto import (
     MODEL_FOR_AUDIO_CLASSIFICATION_MAPPING_NAMES,
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
@@ -56,7 +42,21 @@ from .models.auto.modeling_auto import (
     MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING_NAMES,
 )
 from .training_args import ParallelMode
-from .utils import logging
+from .utils import (
+    CONFIG_NAME,
+    MODEL_CARD_NAME,
+    TF2_WEIGHTS_NAME,
+    WEIGHTS_NAME,
+    cached_path,
+    hf_bucket_url,
+    is_datasets_available,
+    is_offline_mode,
+    is_remote_url,
+    is_tf_available,
+    is_tokenizers_available,
+    is_torch_available,
+    logging,
+)
 
 
 TASK_MAPPING = {
@@ -126,53 +126,57 @@ class ModelCard:
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         r"""
-        Instantiate a :class:`~transformers.ModelCard` from a pre-trained model model card.
+        Instantiate a [`ModelCard`] from a pre-trained model model card.
 
         Parameters:
             pretrained_model_name_or_path: either:
 
-                - a string, the `model id` of a pretrained model card hosted inside a model repo on huggingface.co.
-                  Valid model ids can be located at the root-level, like ``bert-base-uncased``, or namespaced under a
-                  user or organization name, like ``dbmdz/bert-base-german-cased``.
-                - a path to a `directory` containing a model card file saved using the
-                  :func:`~transformers.ModelCard.save_pretrained` method, e.g.: ``./my_model_directory/``.
-                - a path or url to a saved model card JSON `file`, e.g.: ``./my_model_directory/modelcard.json``.
+                - a string, the *model id* of a pretrained model card hosted inside a model repo on huggingface.co.
+                  Valid model ids can be located at the root-level, like `bert-base-uncased`, or namespaced under a
+                  user or organization name, like `dbmdz/bert-base-german-cased`.
+                - a path to a *directory* containing a model card file saved using the [`~ModelCard.save_pretrained`]
+                  method, e.g.: `./my_model_directory/`.
+                - a path or url to a saved model card JSON *file*, e.g.: `./my_model_directory/modelcard.json`.
 
-            cache_dir: (`optional`) string:
+            cache_dir: (*optional*) string:
                 Path to a directory in which a downloaded pre-trained model card should be cached if the standard cache
                 should not be used.
 
-            kwargs: (`optional`) dict: key/value pairs with which to update the ModelCard object after loading.
+            kwargs: (*optional*) dict: key/value pairs with which to update the ModelCard object after loading.
 
                 - The values in kwargs of any keys which are model card attributes will be used to override the loaded
                   values.
                 - Behavior concerning key/value pairs whose keys are *not* model card attributes is controlled by the
-                  `return_unused_kwargs` keyword parameter.
+                  *return_unused_kwargs* keyword parameter.
 
-            proxies: (`optional`) dict, default None:
+            proxies: (*optional*) dict, default None:
                 A dictionary of proxy servers to use by protocol or endpoint, e.g.: {'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}. The proxies are used on each request.
 
-            find_from_standard_name: (`optional`) boolean, default True:
+            find_from_standard_name: (*optional*) boolean, default True:
                 If the pretrained_model_name_or_path ends with our standard model or config filenames, replace them
                 with our standard modelcard filename. Can be used to directly feed a model/config url and access the
                 colocated modelcard.
 
-            return_unused_kwargs: (`optional`) bool:
+            return_unused_kwargs: (*optional*) bool:
 
                 - If False, then this function returns just the final model card object.
-                - If True, then this functions returns a tuple `(model card, unused_kwargs)` where `unused_kwargs` is a
+                - If True, then this functions returns a tuple *(model card, unused_kwargs)* where *unused_kwargs* is a
                   dictionary consisting of the key/value pairs whose keys are not model card attributes: ie the part of
-                  kwargs which has not been used to update `ModelCard` and is otherwise ignored.
+                  kwargs which has not been used to update *ModelCard* and is otherwise ignored.
 
-        Examples::
+        Examples:
 
-            modelcard = ModelCard.from_pretrained('bert-base-uncased')    # Download model card from huggingface.co and cache.
-            modelcard = ModelCard.from_pretrained('./test/saved_model/')  # E.g. model card was saved using `save_pretrained('./test/saved_model/')`
-            modelcard = ModelCard.from_pretrained('./test/saved_model/modelcard.json')
-            modelcard = ModelCard.from_pretrained('bert-base-uncased', output_attentions=True, foo=False)
-
-        """
+        ```python
+        modelcard = ModelCard.from_pretrained(
+            "bert-base-uncased"
+        )  # Download model card from huggingface.co and cache.
+        modelcard = ModelCard.from_pretrained(
+            "./test/saved_model/"
+        )  # E.g. model card was saved using *save_pretrained('./test/saved_model/')*
+        modelcard = ModelCard.from_pretrained("./test/saved_model/modelcard.json")
+        modelcard = ModelCard.from_pretrained("bert-base-uncased", output_attentions=True, foo=False)
+        ```"""
         # This imports every model so let's do it dynamically here.
         from transformers.models.auto.configuration_auto import ALL_PRETRAINED_CONFIG_ARCHIVE_MAP
 
@@ -488,7 +492,10 @@ class TrainingSummary:
         if self.finetuned_from is None:
             model_card += "This model was trained from scratch on "
         else:
-            model_card += f"This model is a fine-tuned version of [{self.finetuned_from}](https://huggingface.co/{self.finetuned_from}) on "
+            model_card += (
+                "This model is a fine-tuned version of"
+                f" [{self.finetuned_from}](https://huggingface.co/{self.finetuned_from}) on "
+            )
 
         if self.dataset is None:
             model_card += "an unknown dataset."
@@ -668,7 +675,7 @@ class TrainingSummary:
             tags = ["generated_from_keras_callback"]
         elif isinstance(tags, str) and tags != "generated_from_keras_callback":
             tags = [tags, "generated_from_keras_callback"]
-        elif "generated_from_trainer" not in tags:
+        elif "generated_from_keras_callback" not in tags:
             tags.append("generated_from_keras_callback")
 
         if keras_history is not None:
@@ -702,6 +709,9 @@ def parse_keras_history(logs):
     """
     if hasattr(logs, "history"):
         # This looks like a `History` object
+        if not hasattr(logs, "epoch"):
+            # This history looks empty, return empty results
+            return None, [], dict()
         logs.history["epoch"] = logs.epoch
         logs = logs.history
     else:
@@ -868,9 +878,10 @@ def extract_hyperparameters_from_trainer(trainer):
     if trainer.args.adafactor:
         hyperparameters["optimizer"] = "Adafactor"
     else:
-        hyperparameters[
-            "optimizer"
-        ] = f"Adam with betas=({trainer.args.adam_beta1},{trainer.args.adam_beta2}) and epsilon={trainer.args.adam_epsilon}"
+        hyperparameters["optimizer"] = (
+            f"Adam with betas=({trainer.args.adam_beta1},{trainer.args.adam_beta2}) and"
+            f" epsilon={trainer.args.adam_epsilon}"
+        )
 
     hyperparameters["lr_scheduler_type"] = trainer.args.lr_scheduler_type.value
     if trainer.args.warmup_ratio != 0.0:

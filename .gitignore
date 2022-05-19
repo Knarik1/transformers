@@ -162,6 +162,11 @@ tags
 # .lock
 *.lock
 
+<<<<<<< HEAD
 examples/pytorch/token-classification/.aim
 examples/pytorch/token-classification/data
 
+=======
+# DS_Store (MacOS)
+.DS_Store
+>>>>>>> upstream/main
